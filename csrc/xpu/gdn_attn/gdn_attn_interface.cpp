@@ -74,6 +74,18 @@ void gdn_attention(
       non_spec_state_indices_tensor.is_contiguous(),
       "non_spec_state_indices_tensor must be contiguous");
 
+  TORCH_CHECK(
+      non_spec_query_start_loc.scalar_type() == at::kInt,
+      "non_spec_query_start_loc must be int32");
+  TORCH_CHECK(
+      non_spec_state_indices_tensor.scalar_type() == at::kInt,
+      "non_spec_state_indices_tensor must be int32");
+  if (has_initial_state.has_value()) {
+    TORCH_CHECK(
+        has_initial_state->scalar_type() == at::kBool,
+        "has_initial_state must be bool");
+  }
+
   // check core_attn_out shape
   TORCH_CHECK(core_attn_out.size(0) == num_actual_tokens);
   TORCH_CHECK(core_attn_out.size(1) == num_v_heads / tp_size);
@@ -95,6 +107,79 @@ void gdn_attention(
   TORCH_CHECK(projected_states_ba.size(0) == num_actual_tokens);
   TORCH_CHECK(projected_states_ba.size(1) == 2 * num_v_heads / tp_size);
 
+    const int pad_slot_id = -1;
+
+  const int64_t batch_size = non_spec_query_start_loc.size(0) - 1;
+  TORCH_CHECK(batch_size >= 0, "batch_size must be non-negative");
+  TORCH_CHECK(
+      batch_size > 0 || num_actual_tokens == 0,
+      "query_start_loc implies empty batch but num_actual_tokens is non-zero");
+  TORCH_CHECK(
+      non_spec_state_indices_tensor.size(0) >= batch_size,
+      "non_spec_state_indices_tensor size must be >= batch_size");
+  if (has_initial_state.has_value()) {
+    TORCH_CHECK(
+        has_initial_state->size(0) >= batch_size,
+        "has_initial_state size must be >= batch_size");
+  }
+
+  if (batch_size > 0) {
+    const int qstart_first = non_spec_query_start_loc[0].item<int>();
+    const int qstart_last = non_spec_query_start_loc[batch_size].item<int>();
+    TORCH_CHECK(qstart_first == 0, "non_spec_query_start_loc[0] must be 0");
+    TORCH_CHECK(
+        qstart_last == num_actual_tokens,
+        "non_spec_query_start_loc[-1] must equal num_actual_tokens");
+
+    // Enforce monotonic non-decreasing offsets to avoid invalid token span
+    // calculations in varlen kernels.
+    int prev = qstart_first;
+    for (int64_t i = 1; i <= batch_size; ++i) {
+      const int curr = non_spec_query_start_loc[i].item<int>();
+      TORCH_CHECK(
+          curr >= prev,
+          "non_spec_query_start_loc must be non-decreasing, but got ",
+          prev,
+          " then ",
+          curr,
+          " at index ",
+          i);
+      prev = curr;
+    }
+
+    const int min_state_idx = non_spec_state_indices_tensor.min().item<int>();
+    const int max_state_idx = non_spec_state_indices_tensor.max().item<int>();
+    TORCH_CHECK(
+        min_state_idx > pad_slot_id,
+        "state index must be > pad_slot_id (-1), got min=",
+        min_state_idx);
+    TORCH_CHECK(
+        max_state_idx < conv_state.size(0),
+        "state index exceeds conv_state slots: max=",
+        max_state_idx,
+        ", conv_state slots=",
+        conv_state.size(0));
+    TORCH_CHECK(
+        max_state_idx < ssm_state.size(0),
+        "state index exceeds ssm_state slots: max=",
+        max_state_idx,
+        ", ssm_state slots=",
+        ssm_state.size(0));
+  }
+
+    if (num_prefills == 0 && num_decodes > 0) {
+        TORCH_CHECK(
+        batch_size >= num_decodes,
+        "decode-only path requires batch_size >= num_decodes, but got batch_size=",
+        batch_size,
+        ", num_decodes=",
+        num_decodes);
+    TORCH_CHECK(
+        num_actual_tokens >= num_decodes,
+        "decode-only path requires num_actual_tokens >= num_decodes (may be padded for CUDAGraph), but got num_actual_tokens=",
+                num_decodes);
+    }
+
   auto& queue = vllm::xpu::vllmGetQueue();
   auto dtype = projected_states_qkvz.dtype();
   auto device = projected_states_qkvz.device();
@@ -107,7 +192,6 @@ void gdn_attention(
   } else {
     TORCH_CHECK(false);
   }
-  const int pad_slot_id = -1;
 
 #define NATIVE_LAUNCHER                                           \
   do {                                                            \
@@ -166,7 +250,15 @@ void gdn_attention(
   } while (0)
 
 #ifdef VLLM_XPU_ENABLE_XE2
-  if (num_prefills > 0) {
+    // XE2 chunk kernel assumes all sequences are multi-token (prefill).
+    // Mixed prefill+decode brings decode sequences into the chunk path, where
+    // each decode sequence gets padded to chunk_size=64 virtual tokens. The
+    // cumulative gating in chunk_prepare_kernel then applies (chunk_size-1)
+    // extra gating steps with a=0, incorrectly decaying the SSM state by
+    // exp((chunk_size-1)*softplus(dt_bias)*A_log_exp) per decode sequence.
+    // Route mixed batches to the native path which handles them token-by-token.
+    const bool has_mixed_prefill_decode = (num_prefills > 0 && num_decodes > 0);
+    if (num_prefills > 0 && !has_mixed_prefill_decode) {
     int batch_size = non_spec_query_start_loc.size(0) - 1;
     int padding_size = batch_size * (gdn::chunk_size_xe2 - 1);
 

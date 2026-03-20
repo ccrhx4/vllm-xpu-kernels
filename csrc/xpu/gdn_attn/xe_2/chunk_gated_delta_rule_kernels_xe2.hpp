@@ -915,7 +915,7 @@ CUTE_DEVICE void chunk_compute_wu_kernel(
   }
 }
 
-template <typename T, class TiledMMA>
+template <typename T, typename TState, class TiledMMA>
 CUTE_DEVICE void chunk_fwd_o_kernel(
     const sycl::local_accessor<float, 1>& slm_mem_const,
     T* core_attn_out,
@@ -927,7 +927,7 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
     const float* a,
     const T* A_log,
     const T* dt_bias,
-    T* ssm_state,
+    TState* ssm_state,
     const int ssm_state_stride_0,
     const int* query_start_loc,
     const int* cache_indices,
@@ -1000,7 +1000,7 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
       continue;
     }
 
-    T* ssm_state_ptr =
+    TState* ssm_state_ptr =
         ssm_state +
         static_cast<int64_t>(cache_indices[batch_id]) * ssm_state_stride_0 +
         v_head_id * head_v_dim * head_k_dim;
@@ -1050,7 +1050,7 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
           make_gmem_ptr(U_ptr),
           make_layout(U_tensor_shape, make_stride(head_v_dim, _1{})));
 
-      T* S_ptr = ssm_state_ptr;
+      TState* S_ptr = ssm_state_ptr;
       auto S_tensor_shape = make_shape(head_v_dim, head_k_dim);
       auto S_tensor = make_tensor(
           make_gmem_ptr(S_ptr),
@@ -1252,25 +1252,25 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
   }
 }
 
-template <typename T>
+template <typename T, typename TState>
 class ChunkPrepareKernel;
 
-template <typename T>
+template <typename T, typename TState>
 class ChunkComputeAKernel;
 
-template <typename T>
+template <typename T, typename TState>
 class ChunkInverseOptKernel;
 
-template <typename T>
+template <typename T, typename TState>
 class ChunkInverseKernel;
 
-template <typename T>
+template <typename T, typename TState>
 class ChunkComputeWUKernel;
 
-template <typename T>
+template <typename T, typename TState>
 class ChunkFwdOKernel;
 
-template <typename T>
+template <typename T, typename TState>
 void kernel_launcher(
     sycl::queue& queue,
     T* core_attn_out,
@@ -1284,7 +1284,7 @@ void kernel_launcher(
     const float* a,
     const T* A_log,
     const T* dt_bias,
-    T* ssm_state,
+    TState* ssm_state,
     const int ssm_state_stride_0,
     const int* query_start_loc,
     const int* cache_indices,
@@ -1315,7 +1315,7 @@ void kernel_launcher(
   int slm_size_prepare = num_v_heads * 2 + chunk_size;
 
   auto event_prepare = queue.submit([&](sycl::handler& cgh) {
-    cgh.parallel_for<ChunkPrepareKernel<T>>(
+    cgh.parallel_for<ChunkPrepareKernel<T, TState>>(
         sycl::nd_range<3>{global_prepare * local_prepare, local_prepare},
         kernel_props,
         [=](auto) {
@@ -1353,7 +1353,7 @@ void kernel_launcher(
   auto event_compute_A = queue.submit([&](sycl::handler& cgh) {
     sycl::local_accessor<float, 1> local_mem(
         sycl::range<1>(slm_size_compute_A), cgh);
-    cgh.parallel_for<ChunkComputeAKernel<T>>(
+    cgh.parallel_for<ChunkComputeAKernel<T, TState>>(
         sycl::nd_range<3>{global_compute_A * local_compute_A, local_compute_A},
         kernel_props,
         [=](auto) {
@@ -1394,7 +1394,7 @@ void kernel_launcher(
         1);
 
     auto event_inverse = queue.submit([&](sycl::handler& cgh) {
-      cgh.parallel_for<ChunkInverseOptKernel<T>>(
+      cgh.parallel_for<ChunkInverseOptKernel<T, TState>>(
           sycl::nd_range<3>{global_inverse * local_inverse, local_inverse},
           kernel_props,
           [=](auto) {
@@ -1423,7 +1423,7 @@ void kernel_launcher(
     auto event_inverse = queue.submit([&](sycl::handler& cgh) {
       sycl::local_accessor<float, 1> local_mem(
           sycl::range<1>(slm_size_inverse), cgh);
-      cgh.parallel_for<ChunkInverseKernel<T>>(
+      cgh.parallel_for<ChunkInverseKernel<T, TState>>(
           sycl::nd_range<3>{global_inverse * local_inverse, local_inverse},
           kernel_props,
           [=](auto) {
@@ -1459,7 +1459,7 @@ void kernel_launcher(
   auto event_compute_wu = queue.submit([&](sycl::handler& cgh) {
     sycl::local_accessor<float, 1> local_mem(
         sycl::range<1>(slm_size_compute_wu), cgh);
-    cgh.parallel_for<ChunkComputeWUKernel<T>>(
+    cgh.parallel_for<ChunkComputeWUKernel<T, TState>>(
         sycl::nd_range<3>{
             global_compute_wu * local_compute_wu, local_compute_wu},
         kernel_props,
@@ -1504,11 +1504,11 @@ void kernel_launcher(
   auto event_fwd_o = queue.submit([&](sycl::handler& cgh) {
     sycl::local_accessor<float, 1> local_mem(
         sycl::range<1>(slm_size_fwd_o), cgh);
-    cgh.parallel_for<ChunkFwdOKernel<T>>(
+    cgh.parallel_for<ChunkFwdOKernel<T, TState>>(
         sycl::nd_range<3>{global_fwd_o * local_fwd_o, local_fwd_o},
         kernel_props,
         [=](auto) {
-          chunk_fwd_o_kernel<T, MMAFwdO>(
+            chunk_fwd_o_kernel<T, TState, MMAFwdO>(
               local_mem,
               core_attn_out,
               A,
@@ -1568,6 +1568,32 @@ void chunk_gated_delta_rule_impl_xe2(
   const int num_v_heads = v.size(1);
   const int head_v_dim = v.size(2);
   const int ssm_state_stride_0 = ssm_state.stride(0);
+    const int ssm_state_num_slots = ssm_state.size(0);
+
+    TORCH_CHECK(
+      cache_indices.size(0) >= batch_size,
+      "cache_indices size ",
+      cache_indices.size(0),
+      " is smaller than batch_size ",
+      batch_size);
+    TORCH_CHECK(
+      query_start_loc.size(0) >= batch_size + 1,
+      "query_start_loc size ",
+      query_start_loc.size(0),
+      " is smaller than batch_size+1 ",
+      batch_size + 1);
+    const int min_cache_idx = cache_indices.min().item<int>();
+    const int max_cache_idx = cache_indices.max().item<int>();
+    TORCH_CHECK(
+      min_cache_idx >= 0,
+      "chunk_gated_delta_rule_xe2 requires cache_indices >= 0 (no pad slots), got min=",
+      min_cache_idx);
+    TORCH_CHECK(
+      max_cache_idx < ssm_state_num_slots,
+      "cache_indices out of bounds: max=",
+      max_cache_idx,
+      ", ssm_state slots=",
+      ssm_state_num_slots);
 
   TORCH_CHECK(num_v_heads % num_k_heads == 0);
 
@@ -1586,21 +1612,21 @@ void chunk_gated_delta_rule_impl_xe2(
       {num_v_heads, total_seqlen + padding_size, head_v_dim},
       torch::dtype(dtype).device(device).requires_grad(false));
 
-#define KERNEL_LAUNCHER(scalar_t)                                  \
-  kernel_launcher<scalar_t>(                                       \
+#define KERNEL_LAUNCHER(compute_t, state_t)                         \
+  kernel_launcher<compute_t, state_t>(                              \
       queue,                                                       \
-      reinterpret_cast<scalar_t*>(core_attn_out.data_ptr()),       \
-      reinterpret_cast<scalar_t*>(q.data_ptr()),                   \
-      reinterpret_cast<scalar_t*>(k.data_ptr()),                   \
-      reinterpret_cast<scalar_t*>(v.data_ptr()),                   \
-      reinterpret_cast<scalar_t*>(A.data_ptr()),                   \
-      reinterpret_cast<scalar_t*>(w.data_ptr()),                   \
-      reinterpret_cast<scalar_t*>(u.data_ptr()),                   \
+      reinterpret_cast<compute_t*>(core_attn_out.data_ptr()),      \
+      reinterpret_cast<compute_t*>(q.data_ptr()),                  \
+      reinterpret_cast<compute_t*>(k.data_ptr()),                  \
+      reinterpret_cast<compute_t*>(v.data_ptr()),                  \
+      reinterpret_cast<compute_t*>(A.data_ptr()),                  \
+      reinterpret_cast<compute_t*>(w.data_ptr()),                  \
+      reinterpret_cast<compute_t*>(u.data_ptr()),                  \
       reinterpret_cast<float*>(b.data_ptr()),                      \
       reinterpret_cast<float*>(a.data_ptr()),                      \
-      reinterpret_cast<scalar_t*>(A_log.data_ptr()),               \
-      reinterpret_cast<scalar_t*>(dt_bias.data_ptr()),             \
-      reinterpret_cast<scalar_t*>(ssm_state.data_ptr()),           \
+      reinterpret_cast<compute_t*>(A_log.data_ptr()),              \
+      reinterpret_cast<compute_t*>(dt_bias.data_ptr()),            \
+      reinterpret_cast<state_t*>(ssm_state.data_ptr()),            \
       ssm_state_stride_0,                                          \
       reinterpret_cast<int*>(query_start_loc.data_ptr()),          \
       reinterpret_cast<int*>(cache_indices.data_ptr()),            \
@@ -1614,14 +1640,33 @@ void chunk_gated_delta_rule_impl_xe2(
       num_v_heads,                                                 \
       head_v_dim);
 
-  if (core_attn_out.scalar_type() == at::kBFloat16) {
-    using scalar_t = bfloat16_t;
-    KERNEL_LAUNCHER(scalar_t)
-  } else if (core_attn_out.scalar_type() == at::kHalf) {
-    using scalar_t = half_t;
-    KERNEL_LAUNCHER(scalar_t)
+#define STATE_DISPATCH(compute_t)                                          \
+  if (ssm_state.scalar_type() == at::kBFloat16) {                          \
+    using state_t = bfloat16_t;                                             \
+    KERNEL_LAUNCHER(compute_t, state_t)                                     \
+  } else if (ssm_state.scalar_type() == at::kHalf) {                        \
+    using state_t = half_t;                                                 \
+    KERNEL_LAUNCHER(compute_t, state_t)                                     \
+  } else if (ssm_state.scalar_type() == at::kFloat) {                       \
+    using state_t = float;                                                  \
+    KERNEL_LAUNCHER(compute_t, state_t)                                     \
+  } else {                                                                   \
+    TORCH_CHECK(false, "Unsupported ssm_state dtype for chunk_gated_delta_rule_xe2"); \
   }
 
+  if (core_attn_out.scalar_type() == at::kBFloat16) {
+    using compute_t = bfloat16_t;
+    STATE_DISPATCH(compute_t)
+  } else if (core_attn_out.scalar_type() == at::kHalf) {
+    using compute_t = half_t;
+    STATE_DISPATCH(compute_t)
+  } else {
+    TORCH_CHECK(
+        false,
+        "Unsupported core_attn_out dtype for chunk_gated_delta_rule_xe2");
+  }
+
+#undef STATE_DISPATCH
 #undef KERNEL_LAUNCHER
 }
 

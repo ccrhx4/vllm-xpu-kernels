@@ -5,7 +5,7 @@
 
 namespace gdn {
 static constexpr int sub_group_size = 32;
-template <typename T, int k_bucket_size>
+template <typename T, typename TState, int k_bucket_size>
 struct gated_delta_rule_kernel {
  public:
   static constexpr int group_size = 256;
@@ -23,11 +23,12 @@ struct gated_delta_rule_kernel {
       const T* a,
       const T* A_log,
       const T* dt_bias,
-      T* ssm_state,
+      TState* ssm_state,
       const int ssm_state_stride_0,
       const int* query_start_loc,
       const int* cache_indices,
       const bool* has_initial_state,
+      const int ssm_state_num_slots,
       const int batch_size,
       const int total_seqlen,
       const int num_k_heads,
@@ -47,6 +48,7 @@ struct gated_delta_rule_kernel {
         query_start_loc(query_start_loc),
         cache_indices(cache_indices),
         has_initial_state(has_initial_state),
+        ssm_state_num_slots(ssm_state_num_slots),
         batch_size(batch_size),
         total_seqlen(total_seqlen),
         num_k_heads(num_k_heads),
@@ -97,14 +99,21 @@ struct gated_delta_rule_kernel {
     float dt_bias_local = dt_bias[num_v_heads_id];
     A_log_local = -sycl::exp(A_log_local);
 
+    int seq_start_offset = query_start_loc[batch_id];
+    int seq_end_offset = query_start_loc[batch_id + 1];
+    int states_id = cache_indices[batch_id];
+    if (seq_end_offset <= seq_start_offset || states_id < 0 ||
+        states_id >= ssm_state_num_slots) {
+      return;
+    }
+
     float state_local[v_dim_per_sg * k_bucket_size];
     float q_local[k_bucket_size];
     float k_local[k_bucket_size];
     float v_local[v_dim_per_sg];
 
-    T* ssm_state_ptr =
-        ssm_state +
-        static_cast<int64_t>(cache_indices[batch_id]) * ssm_state_stride_0;
+    TState* ssm_state_ptr =
+        ssm_state + static_cast<int64_t>(states_id) * ssm_state_stride_0;
 
     // load state
     if (has_initial_state == nullptr || has_initial_state[batch_id]) {
@@ -127,9 +136,6 @@ struct gated_delta_rule_kernel {
         }
       }
     }
-
-    int seq_start_offset = query_start_loc[batch_id];
-    int seq_end_offset = query_start_loc[batch_id + 1];
 
     // The state of each token is calculated iteratively.
     for (int t = seq_start_offset; t < seq_end_offset; ++t) {
@@ -237,7 +243,7 @@ struct gated_delta_rule_kernel {
             [num_v_heads_id * head_k_dim * head_v_dim +
              (k_bucket_size * sg_local_id + i) +
              (head_v_dim_id + j) * head_k_dim] =
-                state_local[j * k_bucket_size + i];
+                static_cast<TState>(state_local[j * k_bucket_size + i]);
       }
     }
   }
@@ -251,11 +257,12 @@ struct gated_delta_rule_kernel {
   const T* a;
   const T* A_log;
   const T* dt_bias;
-  T* ssm_state;
+  TState* ssm_state;
   const int ssm_state_stride_0;
   const int* query_start_loc;
   const int* cache_indices;
   const bool* has_initial_state;
+  const int ssm_state_num_slots;
   const int batch_size;
   const int total_seqlen;
   const int num_k_heads;
@@ -264,7 +271,7 @@ struct gated_delta_rule_kernel {
   const int head_v_dim;
 };
 
-template <typename T, int k_bucket_size>
+template <typename T, typename TState, int k_bucket_size>
 void kernel_launcher(
     sycl::queue& queue,
     T* core_attn_out,
@@ -275,20 +282,26 @@ void kernel_launcher(
     const T* a,
     const T* A_log,
     const T* dt_bias,
-    T* ssm_state,
+    TState* ssm_state,
     const int ssm_state_stride_0,
     const int* query_start_loc,
     const int* cache_indices,
     const bool* has_initial_state,
+    const int ssm_state_num_slots,
     const int batch_size,
     const int total_seqlen,
     const int num_k_heads,
     const int head_k_dim,
     const int num_v_heads,
     const int head_v_dim) {
-  using KERNEL = gated_delta_rule_kernel<T, k_bucket_size>;
+  using KERNEL = gated_delta_rule_kernel<T, TState, k_bucket_size>;
   auto range = KERNEL::get_nd_range(batch_size, num_v_heads, head_v_dim);
-  assert(head_v_dim % KERNEL::v_dim_per_group == 0);
+  TORCH_CHECK(
+      head_v_dim % KERNEL::v_dim_per_group == 0,
+      "gated_delta_rule requires head_v_dim divisible by ",
+      KERNEL::v_dim_per_group,
+      " but got ",
+      head_v_dim);
   queue.submit([&](sycl::handler& cgh) {
     KERNEL task(
         core_attn_out,
@@ -304,6 +317,7 @@ void kernel_launcher(
         query_start_loc,
         cache_indices,
         has_initial_state,
+        ssm_state_num_slots,
         batch_size,
         total_seqlen,
         num_k_heads,
@@ -340,35 +354,60 @@ void gated_delta_rule(
   if (num_prefills == 0 && num_decodes > 0) {
     batch_size = num_decodes;
   }
+
+  TORCH_CHECK(batch_size >= 0, "batch_size must be non-negative");
+  TORCH_CHECK(
+      query_start_loc.size(0) >= batch_size + 1,
+      "query_start_loc size ",
+      query_start_loc.size(0),
+      " is smaller than required batch_size+1 ",
+      batch_size + 1);
+  TORCH_CHECK(
+      cache_indices.size(0) >= batch_size,
+      "cache_indices size ",
+      cache_indices.size(0),
+      " is smaller than required batch_size ",
+      batch_size);
+  if (has_initial_state.has_value()) {
+    TORCH_CHECK(
+        has_initial_state->size(0) >= batch_size,
+        "has_initial_state size ",
+        has_initial_state->size(0),
+        " is smaller than required batch_size ",
+        batch_size);
+  }
+
   const int total_seqlen = q.size(0);
   const int num_k_heads = q.size(1);
   const int head_k_dim = q.size(2);
   const int num_v_heads = v.size(1);
   const int head_v_dim = v.size(2);
   const int ssm_state_stride_0 = ssm_state.stride(0);
+  const int ssm_state_num_slots = ssm_state.size(0);
 
   TORCH_CHECK(num_v_heads % num_k_heads == 0);
   TORCH_CHECK(head_k_dim % sub_group_size == 0);
   const int k_bucket_size = head_k_dim / sub_group_size;
 
-#define KERNEL_LAUNCHER(scalar_t, k_bucket_size)                   \
-  kernel_launcher<scalar_t, k_bucket_size>(                        \
+#define KERNEL_LAUNCHER(compute_t, state_t, k_bucket_size)          \
+  kernel_launcher<compute_t, state_t, k_bucket_size>(               \
       queue,                                                       \
-      reinterpret_cast<scalar_t*>(core_attn_out.data_ptr()),       \
-      reinterpret_cast<scalar_t*>(q.data_ptr()),                   \
-      reinterpret_cast<scalar_t*>(k.data_ptr()),                   \
-      reinterpret_cast<scalar_t*>(v.data_ptr()),                   \
-      reinterpret_cast<scalar_t*>(b.data_ptr()),                   \
-      reinterpret_cast<scalar_t*>(a.data_ptr()),                   \
-      reinterpret_cast<scalar_t*>(A_log.data_ptr()),               \
-      reinterpret_cast<scalar_t*>(dt_bias.data_ptr()),             \
-      reinterpret_cast<scalar_t*>(ssm_state.data_ptr()),           \
+      reinterpret_cast<compute_t*>(core_attn_out.data_ptr()),      \
+      reinterpret_cast<compute_t*>(q.data_ptr()),                  \
+      reinterpret_cast<compute_t*>(k.data_ptr()),                  \
+      reinterpret_cast<compute_t*>(v.data_ptr()),                  \
+      reinterpret_cast<compute_t*>(b.data_ptr()),                  \
+      reinterpret_cast<compute_t*>(a.data_ptr()),                  \
+      reinterpret_cast<compute_t*>(A_log.data_ptr()),              \
+      reinterpret_cast<compute_t*>(dt_bias.data_ptr()),            \
+      reinterpret_cast<state_t*>(ssm_state.data_ptr()),            \
       ssm_state_stride_0,                                          \
       reinterpret_cast<int*>(query_start_loc.data_ptr()),          \
       reinterpret_cast<int*>(cache_indices.data_ptr()),            \
       has_initial_state.has_value()                                \
           ? reinterpret_cast<bool*>(has_initial_state->data_ptr()) \
           : nullptr,                                               \
+        ssm_state_num_slots,                                         \
       batch_size,                                                  \
       total_seqlen,                                                \
       num_k_heads,                                                 \
@@ -376,34 +415,49 @@ void gated_delta_rule(
       num_v_heads,                                                 \
       head_v_dim);
 
-#define BUCKET_DISPATCH(scalar_t, k_bucket_size) \
+#define BUCKET_DISPATCH(compute_t, state_t, k_bucket_size) \
   switch (k_bucket_size) {                       \
     case 1:                                      \
-      KERNEL_LAUNCHER(scalar_t, 1)               \
+      KERNEL_LAUNCHER(compute_t, state_t, 1)     \
       break;                                     \
     case 2:                                      \
-      KERNEL_LAUNCHER(scalar_t, 2)               \
+      KERNEL_LAUNCHER(compute_t, state_t, 2)     \
       break;                                     \
     case 4:                                      \
-      KERNEL_LAUNCHER(scalar_t, 4)               \
+      KERNEL_LAUNCHER(compute_t, state_t, 4)     \
       break;                                     \
     case 8:                                      \
-      KERNEL_LAUNCHER(scalar_t, 8)               \
+      KERNEL_LAUNCHER(compute_t, state_t, 8)     \
       break;                                     \
     default:                                     \
       TORCH_CHECK(false);                        \
   }
 
-  if (core_attn_out.scalar_type() == at::kBFloat16) {
-    using scalar_t = sycl::ext::oneapi::bfloat16;
-    BUCKET_DISPATCH(scalar_t, k_bucket_size)
-  } else if (core_attn_out.scalar_type() == at::kHalf) {
-    using scalar_t = sycl::half;
-    BUCKET_DISPATCH(scalar_t, k_bucket_size)
-  } else {
-    using scalar_t = float;
-    BUCKET_DISPATCH(scalar_t, k_bucket_size)
+#define STATE_DISPATCH(compute_t)                                      \
+  if (ssm_state.scalar_type() == at::kBFloat16) {                      \
+    using state_t = sycl::ext::oneapi::bfloat16;                       \
+    BUCKET_DISPATCH(compute_t, state_t, k_bucket_size)                 \
+  } else if (ssm_state.scalar_type() == at::kHalf) {                   \
+    using state_t = sycl::half;                                         \
+    BUCKET_DISPATCH(compute_t, state_t, k_bucket_size)                 \
+  } else if (ssm_state.scalar_type() == at::kFloat) {                  \
+    using state_t = float;                                              \
+    BUCKET_DISPATCH(compute_t, state_t, k_bucket_size)                 \
+  } else {                                                              \
+    TORCH_CHECK(false, "Unsupported ssm_state dtype for gated_delta_rule"); \
   }
+
+  if (core_attn_out.scalar_type() == at::kBFloat16) {
+    using compute_t = sycl::ext::oneapi::bfloat16;
+    STATE_DISPATCH(compute_t)
+  } else if (core_attn_out.scalar_type() == at::kHalf) {
+    using compute_t = sycl::half;
+    STATE_DISPATCH(compute_t)
+  } else {
+    using compute_t = float;
+    STATE_DISPATCH(compute_t)
+  }
+#undef STATE_DISPATCH
 #undef BUCKET_DISPATCH
 #undef KERNEL_LAUNCHER
 }

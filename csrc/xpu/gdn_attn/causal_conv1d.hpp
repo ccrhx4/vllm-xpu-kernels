@@ -78,10 +78,18 @@ struct causal_conv1d_kernel {
     return sycl::nd_range<2>(global * local, local);
   }
 
-  static inline void act_swish(float& x, float beta = 1.0f) {
-    x = x / (1.0f + sycl::exp(-x * beta));
+  static inline void act_swish(float& x, float beta = 1.0f,
+                                float threshold = 20.0f) {
+    // Clamp input to prevent exp overflow
+    float clamped = sycl::clamp(x * beta, -threshold, threshold);
+    x = x / (1.0f + sycl::exp(-clamped));
   }
-  static inline void act_silu(float& x) { act_swish(x, 1.0f); }
+  static inline void act_silu(float& x) { act_swish(x, 1.0f, 20.0f); }
+
+  static inline void clamp_result(float& x, float min_val = -100.0f,
+                                   float max_val = 100.0f) {
+    x = sycl::clamp(x, min_val, max_val);
+  }
 
   [[sycl::reqd_sub_group_size(sub_group_size)]] void
   operator()(sycl::nd_item<2> item) const {
@@ -261,10 +269,20 @@ struct causal_conv1d_kernel {
     }
 
     float res[elems_per_item];
+    // Initialize with bias first (matches Python implementation for accuracy)
+    if (conv_bias != nullptr) {
 #pragma unroll
-    for (int i = 0; i < elems_per_item; ++i) {
-      res[i] = 0.0f;
+      for (int e = 0; e < elems_per_item; ++e) {
+        res[e] = static_cast<float>(conv_bias[reordered_elems_id + e]);
+      }
+    } else {
+#pragma unroll
+      for (int e = 0; e < elems_per_item; ++e) {
+        res[e] = 0.0f;
+      }
     }
+
+    // Then accumulate convolution result
 #pragma unroll
     for (int i = 0; i < Width; ++i) {
 #pragma unroll
@@ -274,11 +292,10 @@ struct causal_conv1d_kernel {
       }
     }
 
-    if (conv_bias != nullptr) {
+    // Clamp result to prevent overflow in activation function
 #pragma unroll
-      for (int e = 0; e < elems_per_item; ++e) {
-        res[e] += conv_bias[reordered_elems_id + e];
-      }
+    for (int e = 0; e < elems_per_item; ++e) {
+      clamp_result(res[e]);
     }
 
     // save states
@@ -419,8 +436,9 @@ struct update_states_kernel {
 
     int seq_start_offset = query_start_loc[batch_id];
     int seq_end_offset = query_start_loc[batch_id + 1];
-    if (seq_end_offset - seq_start_offset == 1) {
-      // only update if prefill
+    // Skip decode (seqlen==1, handled inplace) and padded (seqlen==0) entries;
+    // only copy tmp -> state for prefill (seqlen>1).
+    if (seq_end_offset - seq_start_offset <= 1) {
       return;
     }
 
@@ -576,6 +594,72 @@ void causal_conv1d(
   const int conv_elems = conv_weights.size(0);
   const int width = conv_weights.size(1);
   const int conv_states_stride_0 = conv_states.stride(0);
+  const int conv_states_num_slots = conv_states.size(0);
+
+  TORCH_CHECK(
+      cache_indices.size(0) >= batch_size,
+      "cache_indices size ",
+      cache_indices.size(0),
+      " is smaller than batch_size ",
+      batch_size);
+  TORCH_CHECK(
+      query_start_loc.size(0) >= batch_size + 1,
+      "query_start_loc size ",
+      query_start_loc.size(0),
+      " is smaller than batch_size+1 ",
+      batch_size + 1);
+  TORCH_CHECK(
+      batch_size > 0 || num_actual_tokens == 0,
+      "query_start_loc implies empty batch but num_actual_tokens is non-zero");
+  if (batch_size > 0) {
+    TORCH_CHECK(
+        query_start_loc[0].item<int>() == 0,
+        "query_start_loc[0] must be 0");
+    TORCH_CHECK(
+        query_start_loc[batch_size].item<int>() == num_actual_tokens,
+        "query_start_loc[-1] must equal num_actual_tokens");
+    int prev = query_start_loc[0].item<int>();
+    for (int i = 1; i <= batch_size; ++i) {
+      const int curr = query_start_loc[i].item<int>();
+      TORCH_CHECK(
+          curr >= prev,
+          "query_start_loc must be non-decreasing, but got ",
+          prev,
+          " then ",
+          curr,
+          " at index ",
+          i);
+      prev = curr;
+    }
+  }
+
+  if (num_prefills == 0 && num_decodes > 0) {
+    TORCH_CHECK(
+        batch_size >= num_decodes,
+        "decode-only path requires batch_size >= num_decodes, but got batch_size=",
+        batch_size,
+        ", num_decodes=",
+        num_decodes);
+    TORCH_CHECK(
+        num_actual_tokens >= num_decodes,
+        "decode-only path requires num_actual_tokens >= num_decodes (may be padded for CUDAGraph), but got num_actual_tokens=",
+        num_actual_tokens,
+        ", num_decodes=",
+        num_decodes);
+  }
+
+  const int min_cache_idx = cache_indices.min().item<int>();
+  const int max_cache_idx = cache_indices.max().item<int>();
+  TORCH_CHECK(
+      min_cache_idx > pad_slot_id,
+      "cache_indices must be > pad_slot_id (-1) for active sequences, got min=",
+      min_cache_idx);
+  TORCH_CHECK(
+      max_cache_idx < conv_states_num_slots,
+      "cache_indices out of bounds: max=",
+      max_cache_idx,
+      ", conv_states slots=",
+      conv_states_num_slots);
 
   auto dtype = conv_states.dtype();
   auto device = conv_states.device();
