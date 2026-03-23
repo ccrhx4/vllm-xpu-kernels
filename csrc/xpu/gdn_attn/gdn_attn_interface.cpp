@@ -250,15 +250,11 @@ void gdn_attention(
   } while (0)
 
 #ifdef VLLM_XPU_ENABLE_XE2
-    // XE2 chunk kernel assumes all sequences are multi-token (prefill).
-    // Mixed prefill+decode brings decode sequences into the chunk path, where
-    // each decode sequence gets padded to chunk_size=64 virtual tokens. The
-    // cumulative gating in chunk_prepare_kernel then applies (chunk_size-1)
-    // extra gating steps with a=0, incorrectly decaying the SSM state by
-    // exp((chunk_size-1)*softplus(dt_bias)*A_log_exp) per decode sequence.
-    // Route mixed batches to the native path which handles them token-by-token.
-    const bool has_mixed_prefill_decode = (num_prefills > 0 && num_decodes > 0);
-    if (num_prefills > 0 && !has_mixed_prefill_decode) {
+    // chunk_prepare_kernel now correctly handles partial chunks (including
+    // decode sequences padded to chunk_size virtual tokens) by zeroing gating
+    // contributions for padding positions, so mixed prefill+decode batches are
+    // safe to run on the XE2 path.
+    if (num_prefills > 0) {
     int batch_size = non_spec_query_start_loc.size(0) - 1;
     int padding_size = batch_size * (gdn::chunk_size_xe2 - 1);
 

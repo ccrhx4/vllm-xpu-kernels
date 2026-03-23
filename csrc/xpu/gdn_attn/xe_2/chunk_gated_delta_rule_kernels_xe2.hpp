@@ -139,6 +139,14 @@ CUTE_DEVICE void chunk_prepare_kernel(
 
     while (chunk_id < cumsum_chunks) {
       const int chunk_start_offset = chunk_id * chunk_size;
+      // Number of real tokens in this chunk; the last chunk of a sequence may
+      // be partial (e.g. a decode sequence has current_chunk_size == 1).
+      // Padding positions must contribute zero to the gating scan, otherwise
+      // softplus(0 + dt_bias) * A_log_exp != 0 accumulates phantom decay into
+      // the SSM state of real tokens.
+      const int chunk_local_id = chunk_id - pre_chunks;
+      const int current_chunk_size =
+          sycl::min(chunk_size, seq_len - chunk_local_id * chunk_size);
 
       // assume that (chunk_size % sub_group_size == 0)
       constexpr int local_num = chunk_size / sub_group_size;
@@ -152,10 +160,16 @@ CUTE_DEVICE void chunk_prepare_kernel(
       }
       CUTE_UNROLL
       for (int c = 0; c < local_num; ++c) {
-        float a_h = g_local[c] + dt_bias_h;
-        a_h = act_softplus(a_h) * A_log_exp_h;
-        g_local[c] = a_h;
-        g_local_sum += a_h;
+        const int pos = sg_local_id * local_num + c;
+        if (pos < current_chunk_size) {
+          float a_h = g_local[c] + dt_bias_h;
+          a_h = act_softplus(a_h) * A_log_exp_h;
+          g_local[c] = a_h;
+          g_local_sum += a_h;
+        } else {
+          // Padding position: zero contribution to the cumulative gating scan.
+          g_local[c] = 0.0f;
+        }
       }
       g_local_sum =
           sycl::inclusive_scan_over_group(sg, g_local_sum, sycl::plus<float>());
