@@ -52,7 +52,7 @@ template <typename T>
 CUTE_DEVICE void chunk_prepare_kernel(
     const T* q,
     const T* k,
-    const float* a,
+    float* a,
     const T* A_log,
     const T* dt_bias,
     const int* query_start_loc,
@@ -175,9 +175,8 @@ CUTE_DEVICE void chunk_prepare_kernel(
           sycl::inclusive_scan_over_group(sg, g_local_sum, sycl::plus<float>());
       CUTE_UNROLL
       for (int c = local_num - 1; c >= 0; --c) {
-        const_cast<float*>(a)
-            [(chunk_start_offset + sg_local_id * local_num + c) +
-             v_head_id * total_virtual_seqlen] = g_local_sum;
+        a[(chunk_start_offset + sg_local_id * local_num + c) +
+          v_head_id * total_virtual_seqlen] = g_local_sum;
         g_local_sum -= g_local[c];
       }
 
@@ -812,7 +811,8 @@ CUTE_DEVICE void chunk_compute_wu_kernel(
   const int kv_ratio = num_v_heads / num_k_heads;
 
   for (int batch_id = 0; batch_id < batch_size; ++batch_id) {
-    const bool initial_state = has_initial_state[batch_id];
+    const bool initial_state =
+        has_initial_state != nullptr && has_initial_state[batch_id];
     const int seq_start_offset = query_start_loc[batch_id];
     const int seq_end_offset = query_start_loc[batch_id + 1];
     const int seq_len = seq_end_offset - seq_start_offset;
@@ -1002,7 +1002,8 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
   int pre_chunks = 0;
 
   for (int batch_id = 0; batch_id < batch_size; ++batch_id) {
-    const bool initial_state = has_initial_state[batch_id];
+    const bool initial_state =
+        has_initial_state != nullptr && has_initial_state[batch_id];
     const int seq_start_offset = query_start_loc[batch_id];
     const int seq_end_offset = query_start_loc[batch_id + 1];
     const int seq_len = seq_end_offset - seq_start_offset;
@@ -1285,7 +1286,7 @@ template <typename T, typename TState>
 class ChunkFwdOKernel;
 
 template <typename T, typename TState>
-void kernel_launcher(
+sycl::event kernel_launcher(
     sycl::queue& queue,
     T* core_attn_out,
     const T* q,
@@ -1336,7 +1337,7 @@ void kernel_launcher(
           chunk_prepare_kernel<T>(
               q,
               k,
-              a,
+              const_cast<float*>(a),
               A_log,
               dt_bias,
               query_start_loc,
@@ -1365,6 +1366,7 @@ void kernel_launcher(
   int slm_size_compute_A = chunk_size;
 
   auto event_compute_A = queue.submit([&](sycl::handler& cgh) {
+    cgh.depends_on(event_prepare);
     sycl::local_accessor<float, 1> local_mem(
         sycl::range<1>(slm_size_compute_A), cgh);
     cgh.parallel_for<ChunkComputeAKernel<T, TState>>(
@@ -1389,6 +1391,7 @@ void kernel_launcher(
   });
   EventManager::getInstance().addEvent(event_compute_A);
 
+  sycl::event event_inverse;
   if (vllm::xpu::is_bmg()) {
     using WGTileInverse = chunk_gemm_policy_inverse::WGTile;
     using SGLayoutInverse = chunk_gemm_policy_inverse::SGLayout;
@@ -1407,7 +1410,8 @@ void kernel_launcher(
             num_v_heads * num_v_heads,
         1);
 
-    auto event_inverse = queue.submit([&](sycl::handler& cgh) {
+    event_inverse = queue.submit([&](sycl::handler& cgh) {
+      cgh.depends_on(event_compute_A);
       cgh.parallel_for<ChunkInverseOptKernel<T, TState>>(
           sycl::nd_range<3>{global_inverse * local_inverse, local_inverse},
           kernel_props,
@@ -1434,7 +1438,8 @@ void kernel_launcher(
         1, sm_count * MaxThreadsPerSM / inverse_items, 1);
     int slm_size_inverse = chunk_size * chunk_size * 2;
 
-    auto event_inverse = queue.submit([&](sycl::handler& cgh) {
+    event_inverse = queue.submit([&](sycl::handler& cgh) {
+      cgh.depends_on(event_compute_A);
       sycl::local_accessor<float, 1> local_mem(
           sycl::range<1>(slm_size_inverse), cgh);
       cgh.parallel_for<ChunkInverseKernel<T, TState>>(
@@ -1471,6 +1476,7 @@ void kernel_launcher(
   int slm_size_compute_wu = num_v_heads * 2 + chunk_size * 2;
 
   auto event_compute_wu = queue.submit([&](sycl::handler& cgh) {
+    cgh.depends_on(event_inverse);
     sycl::local_accessor<float, 1> local_mem(
         sycl::range<1>(slm_size_compute_wu), cgh);
     cgh.parallel_for<ChunkComputeWUKernel<T, TState>>(
@@ -1516,6 +1522,7 @@ void kernel_launcher(
   int slm_size_fwd_o = chunk_size + chunk_size + chunk_size;
 
   auto event_fwd_o = queue.submit([&](sycl::handler& cgh) {
+    cgh.depends_on(event_compute_wu);
     sycl::local_accessor<float, 1> local_mem(
         sycl::range<1>(slm_size_fwd_o), cgh);
     cgh.parallel_for<ChunkFwdOKernel<T, TState>>(
@@ -1547,6 +1554,7 @@ void kernel_launcher(
         });
   });
   EventManager::getInstance().addEvent(event_fwd_o);
+  return event_fwd_o;
 }
 
 void chunk_gated_delta_rule_impl_xe2(
@@ -1626,6 +1634,18 @@ void chunk_gated_delta_rule_impl_xe2(
       {num_v_heads, total_seqlen + padding_size, head_v_dim},
       torch::dtype(dtype).device(device).requires_grad(false));
 
+  // When ssm_state is float32, we pass it directly to the kernel as
+  // TState = float.  Inside gemm_TTS the existing reorder() call converts
+  // each B-matrix tile from the float copy-fragment to a new bf16 DPAS
+  // B-matrix fragment (tCrB), so DPAS constraints are satisfied without any
+  // external blocking pre-cast kernel.  The C-matrix accumulator remains
+  // float32 throughout, and the state write-back path stores float32 directly
+  // back to ssm_state — eliminating the bf16-quantisation round-trip of the
+  // old pre-cast / post-cast approach.
+  torch::Tensor ssm_state_work = ssm_state;  // alias; works for all dtypes
+
+  sycl::event event_fwd_o;  // filled by STATE_DISPATCH → KERNEL_LAUNCHER
+
 #define KERNEL_LAUNCHER(compute_t, state_t)                         \
   kernel_launcher<compute_t, state_t>(                              \
       queue,                                                       \
@@ -1640,7 +1660,7 @@ void chunk_gated_delta_rule_impl_xe2(
       reinterpret_cast<float*>(a.data_ptr()),                      \
       reinterpret_cast<compute_t*>(A_log.data_ptr()),              \
       reinterpret_cast<compute_t*>(dt_bias.data_ptr()),            \
-      reinterpret_cast<state_t*>(ssm_state.data_ptr()),            \
+      reinterpret_cast<state_t*>(ssm_state_work.data_ptr()),       \
       ssm_state_stride_0,                                          \
       reinterpret_cast<int*>(query_start_loc.data_ptr()),          \
       reinterpret_cast<int*>(cache_indices.data_ptr()),            \
@@ -1654,17 +1674,20 @@ void chunk_gated_delta_rule_impl_xe2(
       num_v_heads,                                                 \
       head_v_dim);
 
-#define STATE_DISPATCH(compute_t)                                          \
-  if (ssm_state.scalar_type() == at::kBFloat16) {                          \
-    using state_t = bfloat16_t;                                             \
-    KERNEL_LAUNCHER(compute_t, state_t)                                     \
-  } else if (ssm_state.scalar_type() == at::kHalf) {                        \
-    using state_t = half_t;                                                 \
-    KERNEL_LAUNCHER(compute_t, state_t)                                     \
-  } else if (ssm_state.scalar_type() == at::kFloat) {                       \
-    using state_t = float;                                                  \
-    KERNEL_LAUNCHER(compute_t, state_t)                                     \
-  } else {                                                                   \
+#define STATE_DISPATCH(compute_t)                                                    \
+  if (ssm_state_work.scalar_type() == at::kBFloat16) {                              \
+    using state_t = bfloat16_t;                                                      \
+    event_fwd_o = KERNEL_LAUNCHER(compute_t, state_t)                               \
+  } else if (ssm_state_work.scalar_type() == at::kHalf) {                           \
+    using state_t = half_t;                                                          \
+    event_fwd_o = KERNEL_LAUNCHER(compute_t, state_t)                               \
+  } else if (ssm_state_work.scalar_type() == at::kFloat) {                          \
+    /* float32 state: reorder() inside gemm_TTS converts each B-matrix tile     */  \
+    /* from the float copy-fragment to a new bf16 DPAS B-matrix fragment (tCrB) */  \
+    /* in-kernel, satisfying DPAS constraints without an external blocking cast. */  \
+    using state_t = float;                                                           \
+    event_fwd_o = KERNEL_LAUNCHER(compute_t, state_t)                               \
+  } else {                                                                           \
     TORCH_CHECK(false, "Unsupported ssm_state dtype for chunk_gated_delta_rule_xe2"); \
   }
 
@@ -1682,6 +1705,14 @@ void chunk_gated_delta_rule_impl_xe2(
 
 #undef STATE_DISPATCH
 #undef KERNEL_LAUNCHER
+
+  // For float32 ssm_state the kernel writes float32 results directly back to
+  // ssm_state (ssm_state_work is just an alias), so no post-cast is needed.
+  // For bf16 / fp16 state ssm_state_work is also an alias of ssm_state, so
+  // the caller's tensor is updated in-place by the kernel.
+  // event_fwd_o is returned to the caller via EventManager; the caller must
+  // ensure the event has completed before accessing ssm_state again.
+  (void)event_fwd_o;  // already registered with EventManager above
 }
 
 }  // namespace gdn
