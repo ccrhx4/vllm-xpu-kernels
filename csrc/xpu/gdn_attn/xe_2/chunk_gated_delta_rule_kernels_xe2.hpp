@@ -925,8 +925,6 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
     const T* q,  // [total_virtual_seqlen, num_k_heads, head_k_dim]
     const T* k,  // [total_virtual_seqlen, num_k_heads, head_k_dim]
     const float* a,
-    const T* A_log,
-    const T* dt_bias,
     StateT*
         ssm_state,  // [cache_batch_size, num_v_heads, head_v_dim, head_k_dim]
     const int ssm_state_stride_0,
@@ -939,9 +937,6 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
     const int head_k_dim,
     const int num_v_heads,
     const int head_v_dim) {
-  (void)A_log;
-  (void)dt_bias;
-
   auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
   int local_id = item.get_local_linear_id();
   int current_batch_id = item.get_group(0);
@@ -1534,8 +1529,6 @@ void kernel_launcher(
               q,
               k,
               a,
-              A_log,
-              dt_bias,
               ssm_state,
               ssm_state_stride_0,
               query_start_loc,
