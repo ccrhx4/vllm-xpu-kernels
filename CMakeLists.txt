@@ -306,6 +306,7 @@ if(BUILD_SYCL_TLA_KERNELS)
 
   set(SYCL_TLA_KERNELS_COMPILE_FLAGS ${VLLM_GPU_COMPILE_FLAGS})
   list(APPEND SYCL_TLA_KERNELS_COMPILE_FLAGS ${VLLM_CUTLASS_FLAGS})
+  list(APPEND SYCL_TLA_KERNELS_COMPILE_FLAGS "-fno-sycl-instrument-device-code")
 
   # compile static library for attn and grouped_gemm, link this library to vLLM
   # extensions shared library
