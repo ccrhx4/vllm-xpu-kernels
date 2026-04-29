@@ -559,6 +559,10 @@ def parse_args():
         default="./configs/rmsnorm/",
         help="Path to save rmsnorm benchmark results",
     )
+    parser.add_argument("--qk-norm",
+                        action="store_true",
+                        help="Benchmark QK-norm with 3D tensors "
+                             "[tokens, heads, head_dim]")
 
     args = parser.parse_args()
 
