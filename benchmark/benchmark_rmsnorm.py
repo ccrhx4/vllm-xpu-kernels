@@ -429,6 +429,9 @@ if __name__ == "__main__":
             configs.append((h, 1, s))
     
     if getattr(args, 'qk_norm', False):
+        if not HAS_VLLM_OPS:
+            print("ERROR: vllm ops not available, cannot run QK-norm benchmark")
+            sys.exit(1)
         # QK-norm benchmark: 3D tensors [tokens, heads, head_dim]
         head_dim = args.head_size
         # Default configs: sweep token counts × head counts
