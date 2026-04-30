@@ -3,9 +3,34 @@
 
 import torch
 from typing import Optional
-import vllm_xpu_kernels._C  # noqa: F401
-import vllm_xpu_kernels._moe_C  # noqa: F401
-import vllm_xpu_kernels._xpu_C  # noqa: F401
+
+try:
+    import vllm_xpu_kernels._C  # noqa: F401
+    import vllm_xpu_kernels._moe_C  # noqa: F401
+    import vllm_xpu_kernels._xpu_C  # noqa: F401
+except (ImportError, ModuleNotFoundError):
+    # When running from the source tree with PYTHONPATH=., the local
+    # vllm_xpu_kernels/ directory may shadow the installed package.
+    # Fall back to loading the .so files directly from site-packages.
+    import importlib.util
+    import pathlib
+    import site
+
+    _loaded = False
+    for sp in site.getsitepackages():
+        _pkg_dir = pathlib.Path(sp) / "vllm_xpu_kernels"
+        if (_pkg_dir / "_C.abi3.so").exists():
+            for _lib in ("_C.abi3.so", "_moe_C.abi3.so", "_xpu_C.abi3.so"):
+                _so = _pkg_dir / _lib
+                if _so.exists():
+                    torch.ops.load_library(str(_so))
+            _loaded = True
+            break
+    if not _loaded:
+        raise ImportError(
+            "Could not load vllm_xpu_kernels C extensions. "
+            "Ensure vllm-xpu-kernels is installed with: pip install -e ."
+        )
 
 
 # layer norm ops
