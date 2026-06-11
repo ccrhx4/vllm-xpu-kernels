@@ -247,6 +247,7 @@ CUTE_DEVICE void chunk_compute_A_kernel(
 
         reorder(tSrA_c, tCrA_c);
         copy(copy_A_c, tCrA_c, tCgA_c);
+        item.barrier(sycl::access::fence_space::local_space);
       }
       chunk_id += global_chunk_range;
     }
@@ -357,6 +358,7 @@ CUTE_DEVICE void chunk_inverse_kernel(
                 static_cast<T>(A_ptr_save[m_idx * chunk_size + n_idx]);
           }
         }
+        item.barrier(sycl::access::fence_space::local_space);
       }
       chunk_id += global_chunk_range;
     }
@@ -846,6 +848,7 @@ CUTE_DEVICE void chunk_compute_wu_kernel(
             copy(copy_W_c, tCrW_c, tCgW_c);
           }
         }
+        item.barrier(sycl::access::fence_space::local_space);
       }
       chunk_id += global_chunk_range;
     }
@@ -873,6 +876,7 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
     const bool* has_initial_state,
     const int* token_indx,
     const int batch_size,
+    const int num_decodes,
     const int total_virtual_seqlen,
     const int num_k_heads,
     const int head_k_dim,
@@ -1302,6 +1306,7 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
           copy(copy_O_c, tCrO_c, tCgO_c);
         }
       }
+      item.barrier(sycl::access::fence_space::local_space);
     }
     pre_chunks += current_chunks;
   }
@@ -1346,6 +1351,7 @@ void kernel_launcher(
     const bool* has_initial_state,
     const int* token_indx,
     const int batch_size,
+    const int num_decodes,
     const int total_virtual_seqlen,
     const int num_k_heads,
     const int head_k_dim,
@@ -1573,6 +1579,7 @@ void kernel_launcher(
               has_initial_state,
               token_indx,
               batch_size,
+              num_decodes,
               total_virtual_seqlen,
               num_k_heads,
               head_k_dim,
@@ -1679,6 +1686,7 @@ void chunk_gated_delta_rule_impl_xe2(
           : nullptr,                                               \
       token_indx,                                                  \
       batch_size,                                                  \
+      num_decodes,                                                 \
       total_virtual_seqlen,                                        \
       num_k_heads,                                                 \
       head_k_dim,                                                  \
