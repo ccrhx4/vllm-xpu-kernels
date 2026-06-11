@@ -247,6 +247,7 @@ CUTE_DEVICE void chunk_compute_A_kernel(
 
         reorder(tSrA_c, tCrA_c);
         copy(copy_A_c, tCrA_c, tCgA_c);
+        item.barrier(sycl::access::fence_space::local_space);
       }
       chunk_id += global_chunk_range;
     }
@@ -357,6 +358,7 @@ CUTE_DEVICE void chunk_inverse_kernel(
                 static_cast<T>(A_ptr_save[m_idx * chunk_size + n_idx]);
           }
         }
+        item.barrier(sycl::access::fence_space::local_space);
       }
       chunk_id += global_chunk_range;
     }
@@ -846,6 +848,7 @@ CUTE_DEVICE void chunk_compute_wu_kernel(
             copy(copy_W_c, tCrW_c, tCgW_c);
           }
         }
+        item.barrier(sycl::access::fence_space::local_space);
       }
       chunk_id += global_chunk_range;
     }
@@ -1192,6 +1195,7 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
           copy(copy_O_c, tCrO_c, tCgO_c);
         }
       }
+      item.barrier(sycl::access::fence_space::local_space);
     }
     pre_chunks += current_chunks;
   }
