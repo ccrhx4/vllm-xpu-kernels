@@ -794,15 +794,26 @@ CUTE_DEVICE void chunk_compute_wu_kernel(
     while (chunk_id < cumsum_chunks) {
       const int chunk_start_offset = chunk_id * chunk_size;
 
+      const int chunk_offset_in_seq = (chunk_id - pre_chunks) * chunk_size;
+      int current_chunk_size = seq_len - chunk_offset_in_seq;
+      if (current_chunk_size > chunk_size) {
+        current_chunk_size = chunk_size;
+      }
+
       for (int v_head_id = 0; v_head_id < num_v_heads; ++v_head_id) {
         CUTE_UNROLL
         for (int e = local_id; e < chunk_size; e += local_range) {
-          float beta_value =
-              b[(chunk_start_offset + e) + v_head_id * total_virtual_seqlen];
-          float a_value =
-              a[(chunk_start_offset + e) + v_head_id * total_virtual_seqlen];
-          beta_slm_ptr[e] = beta_value;
-          g_slm_ptr[e] = sycl::exp(a_value) * beta_value;
+          if (e < current_chunk_size) {
+            float beta_value =
+                b[(chunk_start_offset + e) + v_head_id * total_virtual_seqlen];
+            float a_value =
+                a[(chunk_start_offset + e) + v_head_id * total_virtual_seqlen];
+            beta_slm_ptr[e] = beta_value;
+            g_slm_ptr[e] = sycl::exp(a_value) * beta_value;
+          } else {
+            beta_slm_ptr[e] = 0.0f;
+            g_slm_ptr[e] = 0.0f;
+          }
         }
 
         item.barrier(sycl::access::fence_space::local_space);
