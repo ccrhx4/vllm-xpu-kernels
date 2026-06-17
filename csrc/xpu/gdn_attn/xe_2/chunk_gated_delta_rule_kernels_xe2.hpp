@@ -212,6 +212,12 @@ CUTE_DEVICE void chunk_compute_A_kernel(
     while (chunk_id < cumsum_chunks) {
       const int chunk_start_offset = chunk_id * chunk_size;
 
+      const int chunk_offset_in_seq = (chunk_id - pre_chunks) * chunk_size;
+      int current_chunk_size = seq_len - chunk_offset_in_seq;
+      if (current_chunk_size > chunk_size) {
+        current_chunk_size = chunk_size;
+      }
+
       for (int v_head_id = 0; v_head_id < num_v_heads; ++v_head_id) {
         CUTE_UNROLL
         for (int e = local_id; e < chunk_size; e += local_range) {
@@ -260,17 +266,21 @@ CUTE_DEVICE void chunk_compute_A_kernel(
           CUTE_UNROLL
           for (int sm = 0; sm < SG_M; ++sm) {
             int m_idx = m_tile_start + m_sg_start + sm;
-            float beta_value =
-                b[(chunk_start_offset + m_idx) +
-                  v_head_id * total_virtual_seqlen];
-
-            tSrA_c(sn * SG_M + sm) *=
-                sycl::exp(g_slm_ptr[(m_idx)] - g_slm_ptr[n_idx]) * beta_value;
-            if (m_idx == n_idx) {
-              tSrA_c(sn * SG_M + sm) = 1.0f;
-            }
-            if (m_idx < n_idx) {
+            if (m_idx >= current_chunk_size || n_idx >= current_chunk_size) {
               tSrA_c(sn * SG_M + sm) = 0.0f;
+            } else {
+              float beta_value =
+                  b[(chunk_start_offset + m_idx) +
+                    v_head_id * total_virtual_seqlen];
+
+              tSrA_c(sn * SG_M + sm) *=
+                  sycl::exp(g_slm_ptr[(m_idx)] - g_slm_ptr[n_idx]) * beta_value;
+              if (m_idx == n_idx) {
+                tSrA_c(sn * SG_M + sm) = 1.0f;
+              }
+              if (m_idx < n_idx) {
+                tSrA_c(sn * SG_M + sm) = 0.0f;
+              }
             }
           }
         }
