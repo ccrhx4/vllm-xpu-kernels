@@ -41,95 +41,6 @@ using chunk_gemm_policy_inverse = chunk_gemm_policy_16x16x16;
 using chunk_gemm_policy_compute_wu = chunk_gemm_policy_64x64x32_2x1;
 using chunk_gemm_policy_fwd_o = chunk_gemm_policy_64x64x32_4x2;
 
-// GEMM with FP32 A matrix converted to BF16 on-the-fly via reorder
-// Based on CUTE pattern: separate fragments for FP32 load and BF16 MMA
-template <class ATensor_FP32, class BTensor, class SGCTensor, class TiledMMA>
-CUTE_DEVICE void gemm_TTS_fp32_A(
-    ATensor_FP32 const& A_fp32,  // (M,K) FP32 tensor
-    BTensor const& B,             // (N,K) BF16 tensor  
-    SGCTensor& tCrC,              // (M,N) accumulator
-    int wg_m,
-    int wg_n,
-    TiledMMA const& mma) {
-  
-  auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
-  int local_id = item.get_local_linear_id();
-
-  Tensor cA = make_identity_tensor(A_fp32.shape());
-  Tensor cB = make_identity_tensor(B.shape());
-
-  auto wg_tile = mma.tile_mnk();
-  
-  Tensor gA = local_tile(
-      cA, select<0, 2>(wg_tile), make_coord(wg_m, _));  // (BLK_M,BLK_K,k)
-  Tensor gB = local_tile(
-      cB, select<1, 2>(wg_tile), make_coord(wg_n, _));  // (BLK_N,BLK_K,k)
-
-  // Copy traits infer FP32 from A_fp32 tensor type
-  auto copy_a = get_block_2d_copy_A<void>(mma, A_fp32);
-  auto copy_b = get_block_2d_copy_B<void>(mma, B);
-
-  auto thr_mma = mma.get_slice(local_id);
-  auto thr_copy_a = copy_a.get_slice(local_id);
-  auto thr_copy_b = copy_b.get_slice(local_id);
-
-  // Fragment for loading FP32 A (sized for copy atom, FP32 element type)
-  auto tArA_fp32 = thr_copy_a.partition_sg_fragment_D(gA(_, _, 0));
-  
-  // Fragment for MMA (sized for MMA atom, BF16 element type)
-  auto tCrA_bf16 = thr_mma.partition_sg_fragment_A(gA(_, _, 0));
-  auto tCrB = thr_mma.partition_sg_fragment_B(gB(_, _, 0));
-
-  auto tBrB = thr_copy_b.partition_sg_fragment_D(gB(_, _, 0));
-  Tensor tAgA = thr_copy_a.partition_S(gA);
-  Tensor tBgB = thr_copy_b.partition_S(gB);
-
-  auto prefetch_a = make_block_2d_prefetch(copy_a);
-  auto prefetch_b = make_block_2d_prefetch(copy_b);
-
-  auto thr_prefetch_A = prefetch_a.get_slice(local_id);
-  auto thr_prefetch_B = prefetch_b.get_slice(local_id);
-
-  auto pAgA = thr_prefetch_A.partition_S(gA);
-  auto pBgB = thr_prefetch_B.partition_S(gB);
-
-  const int prefetch_dist = 3;
-  constexpr int barrier_scope = 2;
-
-  int k_tile_count = ceil_div(shape<1>(A_fp32), get<2>(wg_tile));
-  int k_tile_prefetch = 0;
-
-  CUTE_UNROLL
-  for (; k_tile_prefetch < prefetch_dist; k_tile_prefetch++) {
-    prefetch(prefetch_a, pAgA(_, _, _, k_tile_prefetch));
-    prefetch(prefetch_b, pBgB(_, _, _, k_tile_prefetch));
-  }
-
-  for (int k_tile = 0; k_tile < k_tile_count; k_tile++, k_tile_prefetch++) {
-    barrier_arrive(barrier_scope);
-
-    // Load FP32 A into FP32 fragment
-    copy(copy_a, tAgA(_, _, _, k_tile), tArA_fp32);
-    // Load BF16 B into BF16 fragment  
-    copy(copy_b, tBgB(_, _, _, k_tile), tBrB);
-
-    if (k_tile_prefetch < k_tile_count) {
-      prefetch(prefetch_a, pAgA(_, _, _, k_tile_prefetch));
-      prefetch(prefetch_b, pBgB(_, _, _, k_tile_prefetch));
-    }
-
-    // Reorder: FP32→BF16 conversion + layout change for A
-    reorder(tArA_fp32, tCrA_bf16);
-    // Reorder: layout change only for B (already BF16)
-    reorder(tBrB, tCrB);
-
-    // GEMM with BF16 inputs
-    cute::gemm(mma, tCrA_bf16, tCrB, tCrC);
-
-    barrier_wait(barrier_scope);
-  }
-}
-
 CUTE_DEVICE float
 act_softplus(float& x, float beta = 1.0f, float threshold = 20.0f) {
   if (beta * x < threshold) {
@@ -339,15 +250,11 @@ CUTE_DEVICE void chunk_compute_A_kernel(
         Tensor gA_C =
             local_tile(cA, wg_tile, make_coord(0, 0, 0), Step<_1, _1, X>{});
 
-        // Use get_block_2d_copy_D like original (auto-infers FP32 from A_tensor)
         auto copy_A_c = get_block_2d_copy_D<void>(mma, A_tensor);
         auto thr_copy_A_c = copy_A_c.get_slice(local_id);
         
-        // Copy fragment for store (FP32, optimized for block 2D layout)
         auto tCrA_c = thr_copy_A_c.partition_sg_fragment_S(gA_C);
-        // Global memory partition
         auto tCgA_c = thr_copy_A_c.partition_D(gA_C);
-        // Accumulator fragment (FP32, from MMA - different layout)
         auto tSrA_c = thr_mma.partition_sg_fragment_C(gA_C);
 
         clear(tSrA_c);
@@ -379,10 +286,8 @@ CUTE_DEVICE void chunk_compute_A_kernel(
           }
         }
 
-        // Reorder from MMA layout to memory layout (both FP32)
         reorder(tSrA_c, tCrA_c);
         
-        // Store FP32 to global memory
         copy(copy_A_c, tCrA_c, tCgA_c);
         
         item.barrier(sycl::access::fence_space::local_space);
@@ -842,7 +747,7 @@ CUTE_DEVICE void chunk_inverse_opt_kernel(
 template <typename T, class TiledMMA>
 CUTE_DEVICE void chunk_compute_wu_kernel(
     const sycl::local_accessor<float, 1>& slm_mem_const,
-    const T* A_inv,
+    T* A,
     T* w,
     T* u,
     const T* q,
@@ -951,14 +856,14 @@ CUTE_DEVICE void chunk_compute_wu_kernel(
 
         item.barrier(sycl::access::fence_space::local_space);
 
-        const T* A_inv_ptr = A_inv +
+        T* A_ptr = A +
                      static_cast<int64_t>(v_head_id) * total_virtual_seqlen *
                          chunk_size +
                      chunk_start_offset * chunk_size;
-        auto A_inv_tensor_shape = make_shape(chunk_size, chunk_size);
-        auto A_inv_tensor = make_tensor(
-            make_gmem_ptr(A_inv_ptr),
-            make_layout(A_inv_tensor_shape, make_stride(chunk_size, _1{})));
+        auto A_tensor_shape = make_shape(chunk_size, chunk_size);
+        auto A_tensor = make_tensor(
+            make_gmem_ptr(A_ptr),
+            make_layout(A_tensor_shape, make_stride(chunk_size, _1{})));
 
         auto v_ptr = v +
                      static_cast<int64_t>(chunk_start_offset) * num_v_heads *
@@ -990,7 +895,7 @@ CUTE_DEVICE void chunk_compute_wu_kernel(
           auto tSrU_c = thr_mma.partition_sg_fragment_C(gU_C);
           clear(tSrU_c);
           gemm_TTS_k_multi(
-              A_inv_tensor, V_tensor_T, tSrU_c, 0, dv, mma, beta_slm_ptr);
+              A_tensor, V_tensor_T, tSrU_c, 0, dv, mma, beta_slm_ptr);
           reorder(tSrU_c, tCrU_c);
           copy(copy_U_c, tCrU_c, tCgU_c);
         }
@@ -1027,7 +932,7 @@ CUTE_DEVICE void chunk_compute_wu_kernel(
             auto tSrW_c = thr_mma.partition_sg_fragment_C(gW_C);
             clear(tSrW_c);
             gemm_TTS_k_multi(
-                A_inv_tensor, K_tensor_T, tSrW_c, 0, dk, mma, g_slm_ptr);
+                A_tensor, K_tensor_T, tSrW_c, 0, dk, mma, g_slm_ptr);
             reorder(tSrW_c, tCrW_c);
             copy(copy_W_c, tCrW_c, tCgW_c);
           }
@@ -1044,7 +949,7 @@ template <typename T, typename StateT, class TiledMMA>
 CUTE_DEVICE void chunk_fwd_o_kernel(
     const sycl::local_accessor<float, 1>& slm_mem_const,  // [3 * chunk_size]
     T* core_attn_out,  // [total_seqlen, num_v_heads, head_v_dim]
-    const T* A_inv,  // [num_v_heads, total_virtual_seqlen, chunk_size], temp O2 buffer
+    T* A,  // [num_v_heads, total_virtual_seqlen, chunk_size], temp O2 buffer
     T* w,  // [num_v_heads, total_virtual_seqlen, head_k_dim]
     T* u,  // [num_v_heads, total_virtual_seqlen, head_v_dim]
     const T* q,  // [total_virtual_seqlen, num_k_heads, head_k_dim]
@@ -1202,7 +1107,7 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
               K_tensor_shape, make_stride(head_k_dim * num_k_heads, _1{})));
 
       auto O2_ptr =
-          A_inv +
+          A +
           static_cast<int64_t>(v_head_id) * total_virtual_seqlen * chunk_size +
           chunk_offset * chunk_size;
       auto O2_tensor_shape = make_shape(current_chunk_size, chunk_size);
