@@ -735,3 +735,314 @@ def test_rms_norm_mxfp4_quant(
     if add_residual:
         torch.testing.assert_close(ref_residual, ops_residual,
                                    atol=1e-2, rtol=1e-2)
+
+
+# ---------------------------------------------------------------------------
+# Gemma variants: fold the (1 + weight) offset into the normalization in fp32,
+# matching GemmaRMSNorm's `x_normed_fp32 * (1 + weight.float())`.
+# ---------------------------------------------------------------------------
+def _ref_gemma_rms_norm(
+    layer: RMSNorm,
+    x: torch.Tensor,
+    residual: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    x_f32 = x.float()
+    if residual is not None:
+        residual = residual.clone()
+        z_half = (x_f32 + residual.float()).to(x.dtype)
+        residual = z_half.clone()
+        x_f32 = z_half.float()
+    variance = x_f32.pow(2).mean(dim=-1, keepdim=True)
+    inv_rms = torch.rsqrt(variance + layer.variance_epsilon)
+    normed = x_f32 * inv_rms * (layer.weight.float() + 1.0)
+    return normed, residual
+
+
+def _ops_gemma_per_token_quant(
+    weight: torch.Tensor,
+    x: torch.Tensor,
+    quant_dtype: torch.dtype,
+    residual: torch.Tensor | None,
+    scale_ub: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    x = x.contiguous()
+    out = torch.empty_like(x, dtype=quant_dtype)
+    num_tokens = x.numel() // x.shape[-1]
+    scales = torch.empty(num_tokens, dtype=torch.float32, device=x.device)
+    if residual is not None:
+        residual = residual.clone().contiguous()
+    torch.ops._C.gemma_rms_norm_dynamic_per_token_quant(
+        out, x, weight, scales, EPS, scale_ub, residual)
+    return out, scales, residual
+
+
+def _ops_gemma_rms_norm_static_fp8_quant(
+    weight: torch.Tensor,
+    x: torch.Tensor,
+    scale: torch.Tensor,
+) -> torch.Tensor:
+    out = torch.empty_like(x, dtype=torch.float8_e4m3fn)
+    torch.ops._C.gemma_rms_norm_static_fp8_quant(out, x, weight, scale, EPS)
+    return out
+
+
+def _ops_fused_add_gemma_rms_norm_static_fp8_quant(
+    weight: torch.Tensor,
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    scale: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    out = torch.empty(x.shape[-1], dtype=torch.float8_e4m3fn,
+                      device=x.device).expand_as(x).contiguous()
+    residual = residual.clone().contiguous()
+    torch.ops._C.fused_add_gemma_rms_norm_static_fp8_quant(
+        out, x, residual, weight, scale, EPS)
+    return out, residual
+
+
+@pytest.mark.parametrize("num_tokens", NUM_TOKENS)
+@pytest.mark.parametrize("hidden_size", HIDDEN_SIZES)
+@pytest.mark.parametrize("add_residual", ADD_RESIDUAL)
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("quant_dtype", QUANT_DTYPES)
+@pytest.mark.parametrize("seed", SEEDS)
+@pytest.mark.parametrize("device", XPU_DEVICES)
+@torch.inference_mode()
+def test_gemma_rms_norm_dynamic_per_token_quant(
+    num_tokens: int,
+    hidden_size: int,
+    add_residual: bool,
+    dtype: torch.dtype,
+    quant_dtype: torch.dtype,
+    seed: int,
+    device: str,
+) -> None:
+    torch.manual_seed(seed)
+    torch.set_default_device("xpu")
+    torch.xpu.set_device(device)
+
+    # Gemma weights are small deviations around 0 (zero-centered).
+    layer = RMSNorm(hidden_size, eps=EPS).to(dtype=dtype)
+    layer.weight.data.normal_(mean=0.0, std=0.1)
+
+    scale = 1.0 / hidden_size
+    x = torch.randn(num_tokens, hidden_size, dtype=dtype) * scale
+    residual = torch.randn_like(x) * scale if add_residual else None
+
+    ref_normed, ref_residual = _ref_gemma_rms_norm(layer, x, residual)
+    ref_q, ref_scales = _ref_per_token_quant(ref_normed, quant_dtype)
+
+    ops_q, ops_scales, ops_residual = _ops_gemma_per_token_quant(
+        layer.weight.data, x, quant_dtype, residual, None)
+
+    assert ops_q.dtype == quant_dtype
+    assert ops_scales.dtype == torch.float32
+
+    if quant_dtype == torch.int8:
+        torch.testing.assert_close(ref_scales, ops_scales,
+                                   atol=1e-6, rtol=1e-6)
+        torch.testing.assert_close(ref_q, ops_q, atol=1, rtol=0)
+    else:
+        torch.testing.assert_close(ref_scales, ops_scales,
+                                   atol=1e-5, rtol=1e-5)
+        ref_qf = ref_q.float()
+        ops_qf = ops_q.float()
+        if not torch.allclose(ref_qf, ops_qf, atol=1e-6):
+            ref_deq = ref_qf * ref_scales.view(-1, 1)
+            ops_deq = ops_qf * ops_scales.view(-1, 1)
+            torch.testing.assert_close(ref_deq, ops_deq, atol=0.2, rtol=0.15)
+
+    if add_residual:
+        torch.testing.assert_close(ref_residual, ops_residual,
+                                   atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("num_tokens", NUM_TOKENS)
+@pytest.mark.parametrize("hidden_size", HIDDEN_SIZES)
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("seed", SEEDS)
+@pytest.mark.parametrize("device", XPU_DEVICES)
+@pytest.mark.parametrize("strided_input", [False, True])
+@torch.inference_mode()
+def test_gemma_rms_norm_static_fp8_quant(
+    num_tokens: int,
+    hidden_size: int,
+    dtype: torch.dtype,
+    seed: int,
+    device: str,
+    strided_input: bool,
+) -> None:
+    torch.manual_seed(seed)
+    torch.set_default_device("xpu")
+    torch.xpu.set_device(device)
+
+    layer = RMSNorm(hidden_size, eps=EPS).to(dtype=dtype)
+    layer.weight.data.normal_(mean=0.0, std=0.1)
+
+    quant_scale = torch.tensor(1.0, dtype=torch.float32)
+    input_scale = 1.0 / hidden_size
+    last_dim = 2 * hidden_size if strided_input else hidden_size
+    x = torch.randn(num_tokens, last_dim, dtype=dtype) * input_scale
+    x = x[..., :hidden_size]
+    if num_tokens > 1:
+        assert x.is_contiguous() != strided_input
+
+    ref_normed, _ = _ref_gemma_rms_norm(layer, x, None)
+    ref_q = _ref_static_fp8_quant(ref_normed, quant_scale)
+
+    ops_q = _ops_gemma_rms_norm_static_fp8_quant(layer.weight.data, x,
+                                                 quant_scale)
+
+    assert ops_q.dtype == torch.float8_e4m3fn
+    ref_qf = ref_q.float()
+    ops_qf = ops_q.float()
+    if not torch.allclose(ref_qf, ops_qf, atol=1e-6):
+        ref_deq = ref_qf * quant_scale
+        ops_deq = ops_qf * quant_scale
+        torch.testing.assert_close(ref_deq, ops_deq, atol=0.2, rtol=0.15)
+
+
+@pytest.mark.parametrize("num_tokens", NUM_TOKENS)
+@pytest.mark.parametrize("hidden_size", HIDDEN_SIZES)
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("seed", SEEDS)
+@pytest.mark.parametrize("device", XPU_DEVICES)
+@pytest.mark.parametrize("strided_input", [False, True])
+@torch.inference_mode()
+def test_fused_add_gemma_rms_norm_static_fp8_quant(
+    num_tokens: int,
+    hidden_size: int,
+    dtype: torch.dtype,
+    seed: int,
+    device: str,
+    strided_input: bool,
+) -> None:
+    torch.manual_seed(seed)
+    torch.set_default_device("xpu")
+    torch.xpu.set_device(device)
+
+    layer = RMSNorm(hidden_size, eps=EPS).to(dtype=dtype)
+    layer.weight.data.normal_(mean=0.0, std=0.1)
+
+    quant_scale = torch.tensor(1.0, dtype=torch.float32)
+    input_scale = 1.0 / hidden_size
+    last_dim = 2 * hidden_size if strided_input else hidden_size
+    x = torch.randn(num_tokens, last_dim, dtype=dtype) * input_scale
+    x = x[..., :hidden_size]
+    if num_tokens > 1:
+        assert x.is_contiguous() != strided_input
+    residual = torch.randn(num_tokens, hidden_size, dtype=dtype) * input_scale
+
+    ref_normed, ref_residual = _ref_gemma_rms_norm(layer, x, residual)
+    ref_q = _ref_static_fp8_quant(ref_normed, quant_scale)
+
+    ops_q, ops_residual = _ops_fused_add_gemma_rms_norm_static_fp8_quant(
+        layer.weight.data, x, residual, quant_scale)
+
+    assert ops_q.dtype == torch.float8_e4m3fn
+    ref_qf = ref_q.float()
+    ops_qf = ops_q.float()
+    if not torch.allclose(ref_qf, ops_qf, atol=1e-6):
+        ref_deq = ref_qf * quant_scale
+        ops_deq = ops_qf * quant_scale
+        torch.testing.assert_close(ref_deq, ops_deq, atol=0.2, rtol=0.15)
+    torch.testing.assert_close(ops_residual, ref_residual,
+                               atol=1e-2, rtol=1e-2)
+
+
+def _ops_gemma_per_group_quant(
+    weight: torch.Tensor,
+    x: torch.Tensor,
+    quant_dtype: torch.dtype,
+    group_size: int,
+    residual: torch.Tensor | None,
+    scale_ue8m0: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    x = x.contiguous()
+    out = torch.empty_like(x, dtype=quant_dtype)
+    num_tokens = x.numel() // x.shape[-1]
+    num_groups = x.shape[-1] // group_size
+    scales = torch.empty(num_tokens,
+                         num_groups,
+                         dtype=torch.float32,
+                         device=x.device)
+    if residual is not None:
+        residual = residual.clone().contiguous()
+    torch.ops._C.gemma_rms_norm_per_block_quant(
+        out,
+        x,
+        weight,
+        scales,
+        EPS,
+        None,  # scale_ub (not used for per-block)
+        residual,
+        group_size,
+        False,  # is_scale_transposed
+        scale_ue8m0,
+    )
+    return out, scales, residual
+
+
+@pytest.mark.parametrize("num_tokens", [1, 7, 83, 2048])
+@pytest.mark.parametrize("hidden_size", [128, 1024, 5120])
+@pytest.mark.parametrize("group_size", GROUP_SIZES)
+@pytest.mark.parametrize("add_residual", ADD_RESIDUAL)
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("quant_dtype", [torch.float8_e4m3fn, torch.int8])
+@pytest.mark.parametrize("seed", SEEDS)
+@pytest.mark.parametrize("device", XPU_DEVICES)
+@torch.inference_mode()
+def test_gemma_rms_norm_per_block_quant(
+    num_tokens: int,
+    hidden_size: int,
+    group_size: int,
+    add_residual: bool,
+    dtype: torch.dtype,
+    quant_dtype: torch.dtype,
+    seed: int,
+    device: str,
+) -> None:
+    if hidden_size % group_size != 0:
+        pytest.skip(f"hidden_size {hidden_size} not divisible by \
+            group_size {group_size}")
+
+    torch.manual_seed(seed)
+    torch.set_default_device("xpu")
+    torch.xpu.set_device(device)
+
+    # Gemma weights are small deviations around 0 (zero-centered).
+    layer = RMSNorm(hidden_size, eps=EPS).to(dtype=dtype)
+    layer.weight.data.normal_(mean=0.0, std=0.1)
+
+    scale = 1.0 / hidden_size
+    x = torch.randn(num_tokens, hidden_size, dtype=dtype) * scale
+    residual = torch.randn_like(x) * scale if add_residual else None
+
+    # Reference: Gemma RMSNorm (folds 1 + weight in fp32) + per-group quant
+    ref_normed, ref_residual = _ref_gemma_rms_norm(layer, x, residual)
+    ref_q, ref_scales = _ref_per_group_quant(ref_normed, group_size,
+                                             quant_dtype)
+
+    ops_q, ops_scales, ops_residual = _ops_gemma_per_group_quant(
+        layer.weight.data, x, quant_dtype, group_size, residual)
+
+    assert ops_q.dtype == quant_dtype
+    assert ops_scales.dtype == torch.float32
+    assert ops_scales.shape == (num_tokens, hidden_size // group_size)
+
+    torch.testing.assert_close(ref_scales, ops_scales, atol=1e-4, rtol=1e-4)
+
+    if quant_dtype == torch.int8:
+        torch.testing.assert_close(ref_q, ops_q, atol=1, rtol=0)
+    else:
+        num_groups = hidden_size // group_size
+        ref_qf = ref_q.float().view(num_tokens, num_groups, group_size)
+        ops_qf = ops_q.float().view(num_tokens, num_groups, group_size)
+        if not torch.allclose(ref_qf, ops_qf, atol=1e-6):
+            ref_deq = ref_qf * ref_scales.unsqueeze(-1)
+            ops_deq = ops_qf * ops_scales.unsqueeze(-1)
+            torch.testing.assert_close(ref_deq, ops_deq, atol=0.2, rtol=0.15)
+
+    if add_residual:
+        torch.testing.assert_close(ref_residual, ops_residual,
+                                   atol=1e-2, rtol=1e-2)

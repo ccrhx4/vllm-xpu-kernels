@@ -23,7 +23,11 @@ struct alignas(8) vec4_t {
   scalar_t val[4];
 };
 
-template <typename scalar_t, typename out_t, bool has_residual>
+template <
+    typename scalar_t,
+    typename out_t,
+    bool has_residual,
+    bool IS_GEMMA = false>
 class rms_norm_dynamic_per_token_quant_kernel {
  public:
   rms_norm_dynamic_per_token_quant_kernel(
@@ -87,7 +91,11 @@ class rms_norm_dynamic_per_token_quant_kernel {
     for (int i = tid; i < hidden_size; i += local_range) {
       const float x = has_residual ? static_cast<float>(token_residual[i])
                                    : static_cast<float>(token_input[i]);
-      const float norm_x = x * inv_rms * static_cast<float>(weight[i]);
+      float wf = static_cast<float>(weight[i]);
+      if constexpr (IS_GEMMA) {
+        wf += 1.0f;
+      }
+      const float norm_x = x * inv_rms * wf;
       absmax = sycl::max(absmax, sycl::fabs(norm_x));
     }
     absmax = sycl::reduce_over_group(
@@ -115,7 +123,11 @@ class rms_norm_dynamic_per_token_quant_kernel {
     for (int i = tid; i < hidden_size; i += local_range) {
       const float x = has_residual ? static_cast<float>(token_residual[i])
                                    : static_cast<float>(token_input[i]);
-      const float norm_x = x * inv_rms * static_cast<float>(weight[i]);
+      float wf = static_cast<float>(weight[i]);
+      if constexpr (IS_GEMMA) {
+        wf += 1.0f;
+      }
+      const float norm_x = x * inv_rms * wf;
       const float q = norm_x * inv_scale;
 
       if constexpr (std::is_same_v<out_t, int8_t>) {
@@ -145,7 +157,8 @@ template <
     typename scalar_t,
     typename out_t,
     bool has_residual,
-    bool scale_ue8m0>
+    bool scale_ue8m0,
+    bool IS_GEMMA = false>
 class rms_norm_per_block_quant_kernel {
  public:
   rms_norm_per_block_quant_kernel(
@@ -257,8 +270,12 @@ class rms_norm_per_block_quant_kernel {
         vec_n_t<scalar_t, VEC> wv = vweight[c];
 #pragma unroll
         for (int k = 0; k < VEC; ++k) {
-          const float nx = static_cast<float>(xv.val[k]) * inv_rms *
-                           static_cast<float>(wv.val[k]);
+          float w = static_cast<float>(wv.val[k]);
+          if constexpr (IS_GEMMA) {
+            // Gemma folds a (1 + weight) offset applied in fp32.
+            w += 1.0f;
+          }
+          const float nx = static_cast<float>(xv.val[k]) * inv_rms * w;
           nrm[k] = nx;
           lane_absmax = sycl::max(lane_absmax, sycl::fabs(nx));
         }
@@ -496,7 +513,11 @@ class rms_norm_mxfp4_quant_kernel {
   sycl::local_accessor<scalar_t, 1> row_smem;
 };
 
-template <typename scalar_t, typename out_t, int VEC_SIZE>
+template <
+    typename scalar_t,
+    typename out_t,
+    int VEC_SIZE,
+    bool IS_GEMMA = false>
 class rms_norm_static_fp8_quant_kernel {
  public:
   rms_norm_static_fp8_quant_kernel(
@@ -562,8 +583,13 @@ class rms_norm_static_fp8_quant_kernel {
       for (int j = 0; j < VEC_SIZE; j++) {
         float x = static_cast<float>(src[j]);
         // Weight multiply in scalar_t precision to match unfused path
-        float norm_x =
-            static_cast<float>(static_cast<scalar_t>(x * inv_rms) * wgt[j]);
+        float norm_x;
+        if constexpr (IS_GEMMA) {
+          norm_x = x * inv_rms * (static_cast<float>(wgt[j]) + 1.0f);
+        } else {
+          norm_x =
+              static_cast<float>(static_cast<scalar_t>(x * inv_rms) * wgt[j]);
+        }
         float q = norm_x * scale_inv;
         token_output[i * VEC_SIZE + j] =
             static_cast<out_t>(sycl::max(sycl::min(q, fp8_max), -fp8_max));
@@ -581,7 +607,11 @@ class rms_norm_static_fp8_quant_kernel {
   const int hidden_size;
 };
 
-template <typename scalar_t, typename out_t, int VEC_SIZE>
+template <
+    typename scalar_t,
+    typename out_t,
+    int VEC_SIZE,
+    bool IS_GEMMA = false>
 class fused_add_rms_norm_static_fp8_quant_kernel {
  public:
   fused_add_rms_norm_static_fp8_quant_kernel(
@@ -656,8 +686,13 @@ class fused_add_rms_norm_static_fp8_quant_kernel {
       for (int j = 0; j < VEC_SIZE; j++) {
         float x = static_cast<float>(res[j]);
         // Weight multiply in scalar_t precision to match unfused path
-        float norm_x =
-            static_cast<float>(static_cast<scalar_t>(x * inv_rms) * wgt[j]);
+        float norm_x;
+        if constexpr (IS_GEMMA) {
+          norm_x = x * inv_rms * (static_cast<float>(wgt[j]) + 1.0f);
+        } else {
+          norm_x =
+              static_cast<float>(static_cast<scalar_t>(x * inv_rms) * wgt[j]);
+        }
         float q = norm_x * scale_inv;
         token_output[i * VEC_SIZE + j] =
             static_cast<out_t>(sycl::max(sycl::min(q, fp8_max), -fp8_max));
@@ -676,7 +711,7 @@ class fused_add_rms_norm_static_fp8_quant_kernel {
   const int hidden_size;
 };
 
-template <typename scalar_t, typename out_t>
+template <typename scalar_t, typename out_t, bool IS_GEMMA = false>
 void call_rms_norm_dynamic_per_token_quant_kernel(
     torch::Tensor& out,
     std::optional<torch::Tensor>& residual,
@@ -709,7 +744,11 @@ void call_rms_norm_dynamic_per_token_quant_kernel(
     queue.submit([&](sycl::handler& cgh) {
       cgh.parallel_for(
           sycl::nd_range<1>(num_tokens * block_size, block_size),
-          rms_norm_dynamic_per_token_quant_kernel<sycl_t, out_t, has_residual>(
+          rms_norm_dynamic_per_token_quant_kernel<
+              sycl_t,
+              out_t,
+              has_residual,
+              IS_GEMMA>(
               out_ptr,
               residual_ptr,
               (const sycl_t*)input_ptr,
@@ -728,7 +767,7 @@ void call_rms_norm_dynamic_per_token_quant_kernel(
   }
 }
 
-template <typename scalar_t, typename out_t>
+template <typename scalar_t, typename out_t, bool IS_GEMMA = false>
 void call_rms_norm_per_block_quant_kernel(
     torch::Tensor& out,
     std::optional<torch::Tensor>& residual,
@@ -771,7 +810,12 @@ void call_rms_norm_per_block_quant_kernel(
           sycl::range<1>(hidden_size), cgh);
       cgh.parallel_for(
           sycl::nd_range<1>(num_tokens * block_size, block_size),
-          rms_norm_per_block_quant_kernel<sycl_t, out_t, has_residual, ue8m0>(
+          rms_norm_per_block_quant_kernel<
+              sycl_t,
+              out_t,
+              has_residual,
+              ue8m0,
+              IS_GEMMA>(
               out_ptr,
               residual_ptr,
               (const sycl_t*)input_ptr,
@@ -803,7 +847,7 @@ void call_rms_norm_per_block_quant_kernel(
   }
 }
 
-template <typename scalar_t, typename out_t>
+template <typename scalar_t, typename out_t, bool IS_GEMMA = false>
 void call_rms_norm_static_fp8_quant_kernel(
     torch::Tensor& out,
     torch::Tensor const& input,
@@ -833,7 +877,7 @@ void call_rms_norm_static_fp8_quant_kernel(
     queue.submit([&](sycl::handler& cgh) {
       cgh.parallel_for(
           sycl::nd_range<1>(num_tokens * block_size, block_size),
-          rms_norm_static_fp8_quant_kernel<sycl_t, out_t, VS>(
+          rms_norm_static_fp8_quant_kernel<sycl_t, out_t, VS, IS_GEMMA>(
               out.data_ptr<out_t>(),
               (const sycl_t*)input.data_ptr<scalar_t>(),
               input_stride,
@@ -861,7 +905,7 @@ void call_rms_norm_static_fp8_quant_kernel(
   }
 }
 
-template <typename scalar_t, typename out_t>
+template <typename scalar_t, typename out_t, bool IS_GEMMA = false>
 void call_fused_add_rms_norm_static_fp8_quant_kernel(
     torch::Tensor& out,
     torch::Tensor& input,
@@ -893,7 +937,11 @@ void call_fused_add_rms_norm_static_fp8_quant_kernel(
     queue.submit([&](sycl::handler& cgh) {
       cgh.parallel_for(
           sycl::nd_range<1>(num_tokens * block_size, block_size),
-          fused_add_rms_norm_static_fp8_quant_kernel<sycl_t, out_t, VS>(
+          fused_add_rms_norm_static_fp8_quant_kernel<
+              sycl_t,
+              out_t,
+              VS,
+              IS_GEMMA>(
               out.data_ptr<out_t>(),
               (const sycl_t*)input.data_ptr<scalar_t>(),
               input_stride,
@@ -1044,7 +1092,73 @@ void rms_norm_dynamic_per_token_quant(
   }
 }
 
-void rms_norm_per_block_quant(
+void gemma_rms_norm_dynamic_per_token_quant(
+    torch::Tensor& out,
+    torch::Tensor const& input,
+    torch::Tensor const& weight,
+    torch::Tensor& scales,
+    double const epsilon,
+    std::optional<torch::Tensor> scale_ub,
+    std::optional<torch::Tensor> residual) {
+  const at::DeviceGuard device_guard(input.device());
+  TORCH_CHECK(input.is_contiguous(), "input must be contiguous");
+  TORCH_CHECK(out.is_contiguous(), "out must be contiguous");
+  TORCH_CHECK(
+      weight.dtype() == input.dtype(),
+      "weight and input must have the same dtype");
+  TORCH_CHECK(scales.dtype() == torch::kFloat32, "scales must be float32");
+  TORCH_CHECK(
+      out.dtype() == torch::kFloat8_e4m3fn || out.dtype() == torch::kInt8,
+      "output must be float8_e4m3fn or int8");
+  if (scale_ub.has_value()) {
+    TORCH_CHECK(
+        out.dtype() == torch::kFloat8_e4m3fn,
+        "scale_ub is only supported for FP8 output");
+  }
+  if (residual.has_value()) {
+    TORCH_CHECK(
+        residual->scalar_type() == input.scalar_type(),
+        "residual and input must have the same dtype");
+    TORCH_CHECK(residual->is_contiguous(), "residual must be contiguous");
+  }
+
+  if (out.dtype() == torch::kFloat8_e4m3fn) {
+    VLLM_DISPATCH_FLOATING_TYPES(
+        input.scalar_type(), "gemma_rms_norm_dynamic_per_token_quant", [&] {
+          vllm::call_rms_norm_dynamic_per_token_quant_kernel<
+              scalar_t,
+              at::Float8_e4m3fn,
+              /*IS_GEMMA=*/true>(
+              out,
+              residual,
+              input,
+              weight,
+              scale_ub,
+              scales,
+              static_cast<float>(epsilon));
+        });
+  } else {
+    VLLM_DISPATCH_FLOATING_TYPES(
+        input.scalar_type(),
+        "gemma_rms_norm_dynamic_per_token_quant_int8",
+        [&] {
+          vllm::call_rms_norm_dynamic_per_token_quant_kernel<
+              scalar_t,
+              int8_t,
+              /*IS_GEMMA=*/true>(
+              out,
+              residual,
+              input,
+              weight,
+              scale_ub,
+              scales,
+              static_cast<float>(epsilon));
+        });
+  }
+}
+
+template <bool IS_GEMMA>
+static void rms_norm_per_block_quant_impl(
     torch::Tensor& out,
     torch::Tensor const& input,
     torch::Tensor const& weight,
@@ -1084,22 +1198,10 @@ void rms_norm_per_block_quant(
   if (out.dtype() == torch::kFloat8_e4m3fn) {
     VLLM_DISPATCH_FLOATING_TYPES(
         input.scalar_type(), "rms_norm_per_block_quant", [&] {
-          vllm::
-              call_rms_norm_per_block_quant_kernel<scalar_t, at::Float8_e4m3fn>(
-                  out,
-                  residual,
-                  input,
-                  weight,
-                  scales,
-                  static_cast<float>(epsilon),
-                  static_cast<int>(group_size),
-                  is_scale_transposed,
-                  scale_ue8m0);
-        });
-  } else {
-    VLLM_DISPATCH_FLOATING_TYPES(
-        input.scalar_type(), "rms_norm_per_block_quant_int8", [&] {
-          vllm::call_rms_norm_per_block_quant_kernel<scalar_t, int8_t>(
+          vllm::call_rms_norm_per_block_quant_kernel<
+              scalar_t,
+              at::Float8_e4m3fn,
+              IS_GEMMA>(
               out,
               residual,
               input,
@@ -1108,9 +1210,76 @@ void rms_norm_per_block_quant(
               static_cast<float>(epsilon),
               static_cast<int>(group_size),
               is_scale_transposed,
-              /*scale_ue8m0=*/false);
+              scale_ue8m0);
+        });
+  } else {
+    VLLM_DISPATCH_FLOATING_TYPES(
+        input.scalar_type(), "rms_norm_per_block_quant_int8", [&] {
+          vllm::
+              call_rms_norm_per_block_quant_kernel<scalar_t, int8_t, IS_GEMMA>(
+                  out,
+                  residual,
+                  input,
+                  weight,
+                  scales,
+                  static_cast<float>(epsilon),
+                  static_cast<int>(group_size),
+                  is_scale_transposed,
+                  /*scale_ue8m0=*/false);
         });
   }
+}
+
+void rms_norm_per_block_quant(
+    torch::Tensor& out,
+    torch::Tensor const& input,
+    torch::Tensor const& weight,
+    torch::Tensor& scales,
+    double const epsilon,
+    std::optional<torch::Tensor> scale_ub,
+    std::optional<torch::Tensor> residual,
+    int64_t group_size,
+    bool is_scale_transposed,
+    bool scale_ue8m0) {
+  rms_norm_per_block_quant_impl</*IS_GEMMA=*/false>(
+      out,
+      input,
+      weight,
+      scales,
+      epsilon,
+      scale_ub,
+      residual,
+      group_size,
+      is_scale_transposed,
+      scale_ue8m0);
+}
+
+// GemmaRMSNorm variant: folds the (1 + weight) offset in fp32 before the
+// per-token-group fp8/int8 quantization. Required for Gemma-architecture norms
+// (e.g. Qwen3.5); routing them through rms_norm_per_block_quant would drop the
+// +1 and be numerically wrong.
+void gemma_rms_norm_per_block_quant(
+    torch::Tensor& out,
+    torch::Tensor const& input,
+    torch::Tensor const& weight,
+    torch::Tensor& scales,
+    double const epsilon,
+    std::optional<torch::Tensor> scale_ub,
+    std::optional<torch::Tensor> residual,
+    int64_t group_size,
+    bool is_scale_transposed,
+    bool scale_ue8m0) {
+  rms_norm_per_block_quant_impl</*IS_GEMMA=*/true>(
+      out,
+      input,
+      weight,
+      scales,
+      epsilon,
+      scale_ub,
+      residual,
+      group_size,
+      is_scale_transposed,
+      scale_ue8m0);
 }
 
 void rms_norm_static_fp8_quant(
@@ -1159,6 +1328,68 @@ void fused_add_rms_norm_static_fp8_quant(
               vllm::call_fused_add_rms_norm_static_fp8_quant_kernel<
                   scalar_t,
                   fp8_t>(
+                  out,
+                  input,
+                  residual,
+                  weight,
+                  scale,
+                  static_cast<float>(epsilon));
+            });
+      });
+}
+
+void gemma_rms_norm_static_fp8_quant(
+    torch::Tensor& out,
+    torch::Tensor& input,
+    torch::Tensor& weight,
+    torch::Tensor& scale,
+    double epsilon) {
+  const at::DeviceGuard device_guard(input.device());
+  TORCH_CHECK(out.is_contiguous(), "out must be contiguous");
+  TORCH_CHECK(
+      weight.dtype() == input.dtype(),
+      "weight and input must have the same dtype");
+
+  VLLM_DISPATCH_FLOATING_TYPES(
+      input.scalar_type(), "gemma_rms_norm_static_fp8_quant", [&] {
+        VLLM_DISPATCH_FP8_TYPES(
+            out.scalar_type(), "gemma_rms_norm_static_fp8_quant_fp8", [&] {
+              vllm::call_rms_norm_static_fp8_quant_kernel<
+                  scalar_t,
+                  fp8_t,
+                  /*IS_GEMMA=*/true>(
+                  out, input, weight, scale, static_cast<float>(epsilon));
+            });
+      });
+}
+
+void fused_add_gemma_rms_norm_static_fp8_quant(
+    torch::Tensor& out,
+    torch::Tensor& input,
+    torch::Tensor& residual,
+    torch::Tensor& weight,
+    torch::Tensor& scale,
+    double epsilon) {
+  const at::DeviceGuard device_guard(input.device());
+  TORCH_CHECK(out.is_contiguous(), "out must be contiguous");
+  TORCH_CHECK(residual.is_contiguous(), "residual must be contiguous");
+  TORCH_CHECK(
+      residual.scalar_type() == input.scalar_type(),
+      "residual and input must have the same dtype");
+  TORCH_CHECK(
+      weight.scalar_type() == input.scalar_type(),
+      "weight and input must have the same dtype");
+
+  VLLM_DISPATCH_FLOATING_TYPES(
+      input.scalar_type(), "fused_add_gemma_rms_norm_static_fp8_quant", [&] {
+        VLLM_DISPATCH_FP8_TYPES(
+            out.scalar_type(),
+            "fused_add_gemma_rms_norm_static_fp8_quant_fp8",
+            [&] {
+              vllm::call_fused_add_rms_norm_static_fp8_quant_kernel<
+                  scalar_t,
+                  fp8_t,
+                  /*IS_GEMMA=*/true>(
                   out,
                   input,
                   residual,

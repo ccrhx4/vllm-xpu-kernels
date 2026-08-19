@@ -66,6 +66,17 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "bool is_scale_transposed, bool scale_ue8m0=False) -> ()");
   ops.impl("rms_norm_per_block_quant", torch::kXPU, &rms_norm_per_block_quant);
 
+  // GemmaRMSNorm variant: folds (1 + weight) in fp32.
+  ops.def(
+      "gemma_rms_norm_per_block_quant(Tensor! result, Tensor input, "
+      "Tensor weight, Tensor! scale, float epsilon, "
+      "Tensor? scale_ub, Tensor!? residual, int group_size, "
+      "bool is_scale_transposed, bool scale_ue8m0=False) -> ()");
+  ops.impl(
+      "gemma_rms_norm_per_block_quant",
+      torch::kXPU,
+      &gemma_rms_norm_per_block_quant);
+
   ops.def(
       "rms_norm_mxfp4_quant(Tensor! result, Tensor input, Tensor weight, "
       "Tensor! scale, float epsilon, Tensor!? residual, int group_size) "
@@ -88,6 +99,36 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "fused_add_rms_norm_static_fp8_quant",
       torch::kXPU,
       &fused_add_rms_norm_static_fp8_quant);
+
+  // Gemma fused RMSNorm + dynamic per-token quantization (FP8 or INT8).
+  // Folds Gemma's (1 + weight) offset into the norm in fp32.
+  ops.def(
+      "gemma_rms_norm_dynamic_per_token_quant(Tensor! result, Tensor input, "
+      "Tensor weight, Tensor! scale, float epsilon, "
+      "Tensor? scale_ub, Tensor!? residual) -> ()");
+  ops.impl(
+      "gemma_rms_norm_dynamic_per_token_quant",
+      torch::kXPU,
+      &gemma_rms_norm_dynamic_per_token_quant);
+
+  // Gemma fused RMSNorm + static FP8 quantization.
+  ops.def(
+      "gemma_rms_norm_static_fp8_quant(Tensor! result, Tensor input, "
+      "Tensor weight, Tensor scale, float epsilon) -> ()");
+  ops.impl(
+      "gemma_rms_norm_static_fp8_quant",
+      torch::kXPU,
+      &gemma_rms_norm_static_fp8_quant);
+
+  // Gemma in-place fused Add + RMSNorm + static FP8 quantization.
+  ops.def(
+      "fused_add_gemma_rms_norm_static_fp8_quant(Tensor! result, Tensor input, "
+      "Tensor! residual, Tensor weight, "
+      "Tensor scale, float epsilon) -> ()");
+  ops.impl(
+      "fused_add_gemma_rms_norm_static_fp8_quant",
+      torch::kXPU,
+      &fused_add_gemma_rms_norm_static_fp8_quant);
 
   // activation ops
   ops.def("silu_and_mul(Tensor! result, Tensor input) -> ()");

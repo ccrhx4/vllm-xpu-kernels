@@ -52,6 +52,19 @@ void rms_norm_per_block_quant(
     bool is_scale_transposed,
     bool scale_ue8m0);
 
+// GemmaRMSNorm variant of rms_norm_per_block_quant: folds (1 + weight) in fp32.
+void gemma_rms_norm_per_block_quant(
+    torch::Tensor& out,
+    torch::Tensor const& input,
+    torch::Tensor const& weight,
+    torch::Tensor& scales,
+    double const epsilon,
+    std::optional<torch::Tensor> scale_ub,
+    std::optional<torch::Tensor> residual,
+    int64_t group_size,
+    bool is_scale_transposed,
+    bool scale_ue8m0);
+
 void rms_norm_mxfp4_quant(
     torch::Tensor& out,
     torch::Tensor const& input,
@@ -69,6 +82,33 @@ void rms_norm_static_fp8_quant(
     double epsilon);
 
 void fused_add_rms_norm_static_fp8_quant(
+    torch::Tensor& out,
+    torch::Tensor& input,
+    torch::Tensor& residual,
+    torch::Tensor& weight,
+    torch::Tensor& scale,
+    double epsilon);
+
+// Gemma variants of the fused RMSNorm + quant ops. These fold Gemma's
+// (1 + weight) offset into the normalization in fp32 from a raw bf16/fp16
+// weight, matching GemmaRMSNorm's `x_normed_fp32 * (1 + weight.float())`.
+void gemma_rms_norm_dynamic_per_token_quant(
+    torch::Tensor& out,
+    torch::Tensor const& input,
+    torch::Tensor const& weight,
+    torch::Tensor& scales,
+    double const epsilon,
+    std::optional<torch::Tensor> scale_ub,
+    std::optional<torch::Tensor> residual);
+
+void gemma_rms_norm_static_fp8_quant(
+    torch::Tensor& out,
+    torch::Tensor& input,
+    torch::Tensor& weight,
+    torch::Tensor& scale,
+    double epsilon);
+
+void fused_add_gemma_rms_norm_static_fp8_quant(
     torch::Tensor& out,
     torch::Tensor& input,
     torch::Tensor& residual,
