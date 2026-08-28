@@ -9,13 +9,15 @@ void rms_norm(
     torch::Tensor& out,
     torch::Tensor& input,
     std::optional<torch::Tensor> weight,
-    double epsilon);
+    double epsilon,
+    double weight_bias);
 
 void fused_add_rms_norm(
     torch::Tensor& input,
     torch::Tensor& residual,
     std::optional<torch::Tensor> weight,
-    double epsilon);
+    double epsilon,
+    double weight_bias);
 
 void gemma_rms_norm(
     torch::Tensor& out,

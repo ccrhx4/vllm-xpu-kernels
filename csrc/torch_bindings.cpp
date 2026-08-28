@@ -23,16 +23,19 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   // Apply Root Mean Square (RMS) Normalization to the input tensor.
   // FIXME: torch op check consider input & weight is mutable in some ut
   // cases. so we make it mutable here.
+  // weight_bias is added to weight before the elementwise multiply (e.g.
+  // weight_bias=1.0 reproduces Gemma-style "x * (1 + weight)" normalization
+  // via the same generic kernel/op, instead of a dedicated gemma_rms_norm op).
   ops.def(
-      "rms_norm(Tensor! result, Tensor input, Tensor? weight, float epsilon) "
-      "-> "
+      "rms_norm(Tensor! result, Tensor input, Tensor? weight, float epsilon, "
+      "float weight_bias=0.0) -> "
       "()");
   ops.impl("rms_norm", torch::kXPU, &rms_norm);
 
   // In-place fused Add and RMS Normalization.
   ops.def(
       "fused_add_rms_norm(Tensor! input, Tensor! residual, Tensor? weight, "
-      "float epsilon) -> ()");
+      "float epsilon, float weight_bias=0.0) -> ()");
   ops.impl("fused_add_rms_norm", torch::kXPU, &fused_add_rms_norm);
 
   // Gemma RMS Normalization: out = (x / rms(x)) * (1 + weight), folding the

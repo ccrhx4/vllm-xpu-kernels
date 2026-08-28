@@ -792,7 +792,8 @@ void rms_norm(
     torch::Tensor& out,
     torch::Tensor& input,
     std::optional<torch::Tensor> weight,
-    double epsilon) {
+    double epsilon,
+    double weight_bias) {
   const at::DeviceGuard device_guard(input.device());
   TORCH_CHECK(out.is_contiguous());
   if (input.stride(-1) != 1) {
@@ -809,10 +810,10 @@ void rms_norm(
             has_weight ? weight->data_ptr<scalar_t>() : nullptr;
         if (has_weight) {
           vllm::call_rms_norm_kernel<scalar_t, true>(
-              out, input, weight_ptr, epsilon);
+              out, input, weight_ptr, epsilon, static_cast<float>(weight_bias));
         } else {
           vllm::call_rms_norm_kernel<scalar_t, false>(
-              out, input, weight_ptr, epsilon);
+              out, input, weight_ptr, epsilon, static_cast<float>(weight_bias));
         }
       });
 }
@@ -821,7 +822,8 @@ void fused_add_rms_norm(
     torch::Tensor& input,
     torch::Tensor& residual,
     std::optional<torch::Tensor> weight,
-    double epsilon) {
+    double epsilon,
+    double weight_bias) {
   const at::DeviceGuard device_guard(input.device());
   const bool has_weight = weight.has_value();
   if (has_weight) {
@@ -834,10 +836,18 @@ void fused_add_rms_norm(
             has_weight ? weight->data_ptr<scalar_t>() : nullptr;
         if (has_weight) {
           vllm::call_fused_add_rms_norm_kernel<scalar_t, true>(
-              input, residual, weight_ptr, epsilon);
+              input,
+              residual,
+              weight_ptr,
+              epsilon,
+              static_cast<float>(weight_bias));
         } else {
           vllm::call_fused_add_rms_norm_kernel<scalar_t, false>(
-              input, residual, weight_ptr, epsilon);
+              input,
+              residual,
+              weight_ptr,
+              epsilon,
+              static_cast<float>(weight_bias));
         }
       });
 }
