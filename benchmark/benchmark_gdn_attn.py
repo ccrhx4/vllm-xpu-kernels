@@ -173,9 +173,14 @@ def _make_non_spec_inputs(shape: GdnShape, workload: Workload, dtype):
     conv_state = torch.randn(
         (cache_batch_size, width - 1, mixed_qkv_size),
         dtype=dtype, device=DEVICE)
+    # Qwen3.5 (unlike Qwen3-Next) forces the recurrent/temporal SSM state to
+    # fp32 by default: vLLM reads `mamba_ssm_dtype` from the HF config and
+    # applies it as `cache_config.mamba_ssm_cache_dtype`
+    # (see Qwen3_5ForConditionalGenerationConfig.verify_and_update_config in
+    # vllm/model_executor/models/config.py). The conv state stays bf16.
     ssm_state = torch.randn(
         (cache_batch_size, num_v_heads // tp_size, head_v_dim, head_k_dim),
-        dtype=dtype, device=DEVICE)
+        dtype=torch.float32, device=DEVICE)
     conv_weights = torch.randn(
         (mixed_qkv_size, width), dtype=dtype, device=DEVICE)
     conv_bias = torch.randn((mixed_qkv_size, ), dtype=dtype, device=DEVICE)
@@ -188,8 +193,19 @@ def _make_non_spec_inputs(shape: GdnShape, workload: Workload, dtype):
         torch.zeros(1, dtype=torch.int64),
         torch.cumsum(per_seq, dim=0)
     ]).to(torch.int32).to(DEVICE)
-    has_initial_state = (
-        torch.rand(workload.batch_size, device=DEVICE) > 0.5)
+    if workload.mode == "decode":
+        # A decode step is by definition a continuation of a sequence that
+        # already went through prefill, so it always has an established
+        # ssm_state to load (matches the correctness tests' pure-decode
+        # cases, which hardcode has_initial_state=True). Randomizing this
+        # for decode let the native kernel skip the ssm_state global-memory
+        # read for ~half the batch, artificially lowering measured decode
+        # latency relative to real steady-state decode traffic.
+        has_initial_state = torch.ones(
+            workload.batch_size, dtype=torch.bool, device=DEVICE)
+    else:
+        has_initial_state = (
+            torch.rand(workload.batch_size, device=DEVICE) > 0.5)
     non_spec_state_indices_tensor = torch.tensor(
         random.sample(range(cache_batch_size), workload.batch_size),
         device=DEVICE, dtype=torch.int32)
@@ -265,9 +281,11 @@ def _make_spec_inputs(shape: GdnShape, workload: Workload, dtype):
          width - 1 + num_spec_tokens,
          mixed_qkv_size),
         dtype=dtype, device=DEVICE)
+    # See the non-spec input builder above: Qwen3.5 forces the recurrent SSM
+    # state to fp32 by default, distinct from the (bf16) conv state.
     ssm_state = torch.randn(
         (cache_batch_size, num_v_heads // tp_size, head_v_dim, head_k_dim),
-        dtype=dtype, device=DEVICE)
+        dtype=torch.float32, device=DEVICE)
     conv_weights = torch.randn(
         (mixed_qkv_size, width), dtype=dtype, device=DEVICE)
     conv_bias = torch.randn((mixed_qkv_size, ), dtype=dtype, device=DEVICE)
