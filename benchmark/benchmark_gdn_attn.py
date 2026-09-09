@@ -68,6 +68,13 @@ MODEL_SHAPES = [
     GdnShape("Qwen3-Next-80B_tp2", 16, 32, 128, 128, 4, tp_size=2),
     GdnShape("Qwen3-Next-80B_tp4", 16, 32, 128, 128, 4, tp_size=4),
     GdnShape("Qwen3-Next-80B_tp8", 16, 32, 128, 128, 4, tp_size=8),
+    # Qwen3.5-397B-A17B (huggingface.co/Qwen/Qwen3.5-397B-A17B): text_config
+    # linear_num_key_heads=16, linear_num_value_heads=64,
+    # linear_key_head_dim=linear_value_head_dim=128, linear_conv_kernel_dim=4.
+    GdnShape("Qwen3.5-397B-A17B_tp1", 16, 64, 128, 128, 4, tp_size=1),
+    GdnShape("Qwen3.5-397B-A17B_tp2", 16, 64, 128, 128, 4, tp_size=2),
+    GdnShape("Qwen3.5-397B-A17B_tp4", 16, 64, 128, 128, 4, tp_size=4),
+    GdnShape("Qwen3.5-397B-A17B_tp8", 16, 64, 128, 128, 4, tp_size=8),
     # Synthetic shapes to stress wider / larger configurations.
     GdnShape("Synthetic_MHA_16x16",  16, 16, 128, 128, 4),
     GdnShape("Synthetic_16x64x128",  16, 64, 128, 128, 4),
