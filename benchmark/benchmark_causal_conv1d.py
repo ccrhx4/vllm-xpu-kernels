@@ -41,6 +41,14 @@ from benchmark_gdn_attn import (
     _bpe,
     make_inputs,
 )
+# Corrected decode timing helpers (rotate across fresh state buffers and
+# disjoint cache-row groups so results are not inflated by L2 residency of
+# a single reused input/state buffer).
+from benchmark_gdn_attn_decode_rotated import (
+    NUM_STATE_BUFFERS,
+    build_rotating_groups,
+    measure_rotated,
+)
 # isort: on
 
 DEVICE = "xpu"
@@ -109,6 +117,60 @@ def estimate_flops(kwargs):
 
     qkv_per_tok = nk * (2 * hk + hv * nv // nk)
     return 2 * n_tok * qkv_per_tok * width
+
+
+# ----------------------------------------------------------------------------
+# Corrected decode timing (rotated buffers)
+# ----------------------------------------------------------------------------
+def _measure_conv_decode_rotated(shape, workload, dtype):
+    """Rotated-buffer per-iteration timing (us) for decode conv1d.
+
+    The single-buffer loop reuses one conv_state / input set and one set of
+    physical cache rows every iteration. On XPU those stay resident in the
+    large last-level cache, so DRAM traffic is understated and latency is
+    ~1.1-1.3x optimistic (the effect is independent of buffer compression).
+    Rotate across NUM_STATE_BUFFERS freshly built datasets and disjoint
+    cache-row groups, refreshing the in-place-updated conv_state between
+    timed rounds (see measure_rotated). Returns (us_per_iter, kwargs) where
+    kwargs is a representative dataset for the byte/FLOP models.
+    """
+    K = NUM_STATE_BUFFERS
+    datasets = [make_inputs(shape, workload, dtype) for _ in range(K)]
+    cache_batch_size = datasets[0]["conv_state"].shape[0]
+    groups = build_rotating_groups(
+        cache_batch_size, workload.batch_size,
+        datasets[0]["non_spec_state_indices_tensor"].device)
+    n = len(groups)
+
+    def _run(i):
+        kw = datasets[i % K]
+        state_indices = groups[(i // K) % n]
+        torch.ops._xpu_C.causal_conv1d_non_spec(
+            kw["z"],
+            kw["projected_states_qkvz"],
+            kw["projected_states_ba"],
+            kw["num_k_heads"],
+            kw["num_v_heads"],
+            kw["head_k_dim"],
+            kw["head_v_dim"],
+            conv_state=kw["conv_state"],
+            conv_weights=kw["conv_weights"],
+            conv_bias=kw["conv_bias"],
+            activation=kw["activation"],
+            num_prefills=kw["num_prefills"],
+            num_decodes=kw["num_decodes"],
+            num_spec_decodes=kw["num_spec_decodes"],
+            has_initial_state=kw["has_initial_state"],
+            non_spec_query_start_loc=kw["non_spec_query_start_loc"],
+            non_spec_token_indx=kw["non_spec_token_indx"],
+            non_spec_state_indices_tensor=state_indices,
+            num_actual_tokens=kw["num_actual_tokens"],
+            tp_size=kw["tp_size"],
+            reorder_input=kw["reorder_input"])
+
+    mutated = [d["conv_state"] for d in datasets]
+    us = measure_rotated(_run, mutated_state=mutated, n_groups=K * n)
+    return us, datasets[0]
 
 
 # ----------------------------------------------------------------------------
@@ -182,14 +244,22 @@ def benchmark_causal_conv1d(shape_name, workload_name, dtype_str, provider,
         _run()
     torch.xpu.synchronize()
 
-    start_event = torch.xpu.Event(enable_timing=True)
-    end_event = torch.xpu.Event(enable_timing=True)
-    start_event.record()
-    for _ in range(5, iterations):
-        _run()
-    end_event.record()
-    torch.xpu.synchronize()
-    ms = start_event.elapsed_time(end_event) / (iterations - 5)
+    if workload.mode == "decode":
+        # Decode reuses the recurrent conv_state in place; use the rotated
+        # method so L2 residency of a single reused buffer does not inflate
+        # the result. This also replaces the per-iteration byte model's
+        # dataset with the rotated representative dataset.
+        us, kwargs = _measure_conv_decode_rotated(shape, workload, dtype)
+        ms = us / 1000.0
+    else:
+        start_event = torch.xpu.Event(enable_timing=True)
+        end_event = torch.xpu.Event(enable_timing=True)
+        start_event.record()
+        for _ in range(5, iterations):
+            _run()
+        end_event.record()
+        torch.xpu.synchronize()
+        ms = start_event.elapsed_time(end_event) / (iterations - 5)
 
     if provider == "conv1d":
         clear_xpu_cache()
