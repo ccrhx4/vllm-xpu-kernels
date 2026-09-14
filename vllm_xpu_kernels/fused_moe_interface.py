@@ -15,13 +15,22 @@ except ImportError as e:
     FUSEDMOE_AVAILABLE = False
 
 from .moe_utils import (dequant_fp8_block_act, dequant_mxfp8, quant_act_xpu,
-                        ref_fused_moe)
+                        ref_fused_moe, interleave_gate_up_weights_xe20)
 
 REF_FUSED_MOE_ENV = "VLLM_XPU_FUSED_MOE_USE_REF"
 USE_MXFP4_FP8_ENV = "VLLM_XPU_FUSED_MOE_USE_MXFP4_FP8"
 # MXFP8 / block-FP8 use the native Xe2 path by default.
 NATIVE_MXFP8_ENV = "VLLM_XPU_FUSED_MOE_NATIVE_MXFP8"
 NATIVE_BLOCK_FP8_ENV = "VLLM_XPU_FUSED_MOE_NATIVE_BLOCK_FP8"
+# Opt-in single-accumulator interleaved SwiGLU GEMM1+activation fusion,
+# ported from sgl-kernel-xpu (see /work/fusemlp/design.md and
+# /work/fusemlp/USAGE.md for the fusion rationale and the analogous sglang
+# integration). BF16-only, silu/gelu activation only, num_experts % 8 == 0.
+# Off by default: it is opt-in like the sglang integration, since the
+# interleaved weight/bias copies are cached for the lifetime of the layer
+# (see the module docstring on `_InterleavedWeightCache` below for the
+# memory trade-off this implies in vllm's current modular-kernel design).
+FUSED_MOE_INTERLEAVED_ENV = "VLLM_XPU_FUSED_MOE_INTERLEAVED"
 
 def _is_env_enabled(env_name: str, default: str = "0") -> bool:
     value = os.environ.get(env_name, default).strip().upper()
@@ -212,7 +221,10 @@ class XpuFusedMoe:
 
         # 4bits support [E, N, K]
         # other types [E, K, N]
-        if not is_int4 and not is_mxfp4:
+        # The interleaved fusion (see xpu_interleaved marker below) keeps
+        # w13 in the pre-transpose [E, N, K] layout, same as int4/mxfp4.
+        if not is_int4 and not is_mxfp4 and not getattr(
+                w13, "xpu_interleaved", False):
             self.inter_size = w13.shape[-1] // 2
         else:
             self.inter_size = w13.shape[-2] // 2
@@ -275,6 +287,23 @@ class XpuFusedMoe:
         self.recipe = _get_recipe(is_fp8, is_mxfp8, is_mxfp4, is_int4,
                                    is_block_fp8)
         self._use_ref = _should_use_ref_fused_moe(is_mxfp8, is_block_fp8)
+
+        # The single-accumulator interleaved SwiGLU GEMM1+activation fusion
+        # (ported from sgl-kernel-xpu, see /work/fusemlp/design.md) is only
+        # dispatched when the caller has already converted w13 (and its
+        # bias, if any) to the interleaved layout in place -- see
+        # vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method's
+        # `_maybe_interleave_xpu_gate_up_weights`, which is the only place
+        # that sets the `xpu_interleaved` marker and is gated on
+        # VLLM_XPU_FUSED_MOE_INTERLEAVED, activation in (silu, gelu), and
+        # num_experts % 8 == 0. `gemm1_clamp_limit` is not supported by the
+        # fused op, so fall back to the unfused path when it is set.
+        self._interleaved_fuse_enabled = (
+            getattr(w13, "xpu_interleaved", False)
+            and self.recipe == "bf16"
+            and self.activation in ("silu", "gelu")
+            and not self.gemm1_clamp_limit
+        )
         if self.activation == "silu":
             self.act_func = torch.ops._C.silu_and_mul
         elif self.activation == "gelu":
@@ -417,45 +446,71 @@ class XpuFusedMoe:
                 remapped_hidden_states, remapped_scales).to(output.dtype)
             remapped_scales = None
 
-        ########### gemm1 ##################
-        gemm1_output = torch.empty((num_moe_inputs, 2 * self.inter_size),
-                                dtype=output.dtype,
-                                device=output.device)
-        torch.ops._xpu_C.cutlass_grouped_gemm_interface(
-            ptr_A=remapped_hidden_states,
-            ptr_A_scale=remapped_scales,
-            ptr_B=self.w13,
-            ptr_B_scale=self.gemm1_wei_scales,
-            ptr_bias=self.w13_bias,
-            ptr_D=gemm1_output,
-            rows_per_expert=rows_per_expert,
-            N=2 * self.inter_size,
-            K=hidden_size,
-            num_experts=self.num_experts)
-
-        # Apply swiglu_limit clamping before activation
-        if self.gemm1_clamp_limit is not None and self.gemm1_clamp_limit > 0:
-            gate = gemm1_output[:, :self.inter_size]
-            up = gemm1_output[:, self.inter_size:]
-            gate.clamp_(max=self.gemm1_clamp_limit)
-            up.clamp_(min=-self.gemm1_clamp_limit, max=self.gemm1_clamp_limit)
-
-        # act
+        ########### gemm1 (+ fused activation, when eligible) ##########
         act_output = torch.empty(
-            (num_moe_inputs, self.inter_size * self.inter_size_scale),
-            dtype=gemm1_output.dtype,
-            device=gemm1_output.device)
-        if self.activation == "situ":
-            self.act_func(
-                act_output,
-                gemm1_output,
-                self.activation_situ_beta,
-                -1.0
-                if self.activation_situ_linear_beta is None
-                else self.activation_situ_linear_beta,
-            )
+            (num_moe_inputs, self.inter_size),
+            dtype=output.dtype,
+            device=output.device)
+        if self._interleaved_fuse_enabled:
+            # w13/w13_bias were converted in place to the interleaved
+            # gate/up layout by
+            # `_maybe_interleave_xpu_gate_up_weights` in vllm; this single
+            # op replaces the unfused GEMM1 + silu_and_mul/gelu_and_mul
+            # two-step above with one single-accumulator kernel.
+            activation_type = 0 if self.activation == "silu" else 1
+            torch.ops._xpu_C.moe_grouped_mm_xe20_interleaved(
+                output=act_output,
+                activations=remapped_hidden_states,
+                weights=self.w13,
+                bias=self.w13_bias,
+                rows_per_expert=rows_per_expert,
+                num_experts=self.num_experts,
+                activation_type=activation_type,
+                gemm1_alpha=1.702,
+                gemm1_limit=7.0)
         else:
-            self.act_func(act_output, gemm1_output)
+            gemm1_output = torch.empty(
+                (num_moe_inputs, 2 * self.inter_size),
+                dtype=output.dtype,
+                device=output.device)
+            torch.ops._xpu_C.cutlass_grouped_gemm_interface(
+                ptr_A=remapped_hidden_states,
+                ptr_A_scale=remapped_scales,
+                ptr_B=self.w13,
+                ptr_B_scale=self.gemm1_wei_scales,
+                ptr_bias=self.w13_bias,
+                ptr_D=gemm1_output,
+                rows_per_expert=rows_per_expert,
+                N=2 * self.inter_size,
+                K=hidden_size,
+                num_experts=self.num_experts)
+
+            # Apply swiglu_limit clamping before activation
+            if self.gemm1_clamp_limit is not None and self.gemm1_clamp_limit > 0:
+                gate = gemm1_output[:, :self.inter_size]
+                up = gemm1_output[:, self.inter_size:]
+                gate.clamp_(max=self.gemm1_clamp_limit)
+                up.clamp_(min=-self.gemm1_clamp_limit,
+                          max=self.gemm1_clamp_limit)
+
+            # act
+            if self.inter_size_scale != 1:
+                act_output = torch.empty(
+                    (num_moe_inputs,
+                     self.inter_size * self.inter_size_scale),
+                    dtype=gemm1_output.dtype,
+                    device=gemm1_output.device)
+            if self.activation == "situ":
+                self.act_func(
+                    act_output,
+                    gemm1_output,
+                    self.activation_situ_beta,
+                    -1.0
+                    if self.activation_situ_linear_beta is None
+                    else self.activation_situ_linear_beta,
+                )
+            else:
+                self.act_func(act_output, gemm1_output)
 
         ########### gemm2 ##################
         gemm2_output = torch.empty((num_moe_inputs, hidden_size),

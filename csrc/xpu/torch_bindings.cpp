@@ -2,6 +2,7 @@
 #include "xpu/ops.h"
 #ifdef VLLM_MOE_ENABLED
   #include "xpu/grouped_gemm/grouped_gemm_interface.h"
+  #include "xpu/grouped_gemm/moe_interleaved/moe_grouped_mm_interleaved.h"
 #endif
 #include "xpu/lora/lora_ops.h"
 
@@ -64,6 +65,19 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, xpu_ops) {
       "cutlass_grouped_gemm_interface",
       torch::kXPU,
       &cutlass_grouped_gemm_interface);
+
+  // Interleaved single-accumulator SwiGLU MoE grouped-GEMM fusion, ported
+  // from sgl-kernel-xpu (moe_grouped_mm_nt_xe20_interleaved). Xe2/Xe20-only;
+  // requires gate/up weight columns pre-interleaved in 16-wide groups (see
+  // vllm_xpu_kernels.moe_utils.interleave_gate_up_weights_xe20).
+  xpu_ops.def(
+      "moe_grouped_mm_xe20_interleaved(Tensor(a!) output, Tensor activations, "
+      "Tensor weights, Tensor? bias, Tensor rows_per_expert, int num_experts, "
+      "int activation_type, float gemm1_alpha, float gemm1_limit) -> Tensor");
+  xpu_ops.impl(
+      "moe_grouped_mm_xe20_interleaved",
+      torch::kXPU,
+      &moe_grouped_mm_xe20_interleaved);
 #endif
 
   xpu_ops.def(

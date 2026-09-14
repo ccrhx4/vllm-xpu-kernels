@@ -417,3 +417,44 @@ def quant_act_xpu(x, recipe):
         return quant_fp8_block_act(x)
     else:
         raise NotImplementedError(f"Unsupported recipe for quant_act_xpu: {recipe}") # noqa: E501
+
+
+def interleave_gate_up_weights_xe20(
+    w_gate_up: torch.Tensor, group: int = 16
+) -> torch.Tensor:
+    """Repack a block-split gate/up tensor into the 16-wide interleaved layout
+    consumed by `torch.ops._xpu_C.moe_grouped_mm_xe20_interleaved` (the
+    single-accumulator SwiGLU fusion ported from sgl-kernel-xpu; see
+    /work/fusemlp/design.md for the fusion rationale).
+
+    Xe20's DPAS MMA atom has native N-width 16, so columns `c` and `c+16` of
+    an appropriately interleaved weight matrix land in the same lane's
+    register file; grouping gate/up columns in 16-wide pairs
+    (`[g0..g15, u0..u15, g16..g31, u16..u31, ...]`) lets a single accumulator
+    hold both the gate and up partial sums side by side, removing the need
+    for a second accumulator.
+
+    Args:
+        w_gate_up: block-split gate/up weights, shape [E, 2*N, K] (gate is
+            `w_gate_up[:, :N, :]`, up is `w_gate_up[:, N:, :]`), or
+            block-split gate/up bias, shape [E, 2*N].
+        group: the DPAS atom N-width (16 on Xe20).
+
+    Returns:
+        A tensor of the same shape with gate/up columns interleaved in
+        `group`-wide chunks along the N dim (dim 1).
+    """
+    assert w_gate_up.dim() in (2, 3), "expected [E, 2*N] bias or [E, 2*N, K] weight"
+    two_n = w_gate_up.shape[1]
+    assert two_n % (2 * group) == 0, (
+        f"gate+up dim ({two_n}) must be a multiple of 2*group ({2 * group}) "
+        "to interleave into 16-wide gate/up pairs")
+    n = two_n // 2
+    gate, up = w_gate_up.narrow(1, 0, n), w_gate_up.narrow(1, n, n)
+    # [E, n//group, group, ...] each; stack gate/up chunks side by side then
+    # flatten back to [E, 2*N, ...] with layout
+    # [g0..g_{group-1}, u0..u_{group-1}, g_group..g_{2group-1}, ...].
+    gate_groups = gate.unflatten(1, (n // group, group))
+    up_groups = up.unflatten(1, (n // group, group))
+    interleaved = torch.stack([gate_groups, up_groups], dim=2).flatten(1, 3)
+    return interleaved.contiguous()
