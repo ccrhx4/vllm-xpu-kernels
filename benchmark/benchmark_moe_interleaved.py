@@ -129,14 +129,45 @@ shape_configs = [
         "avg_m": 512,
     },
     # Qwen3.5-397B-A17B (huggingface.co/Qwen/Qwen3.5-397B-A17B), routed MoE
-    # experts, prefill batch 8192 tokens, TP=4. From its text_config:
-    #   hidden_size=4096, moe_intermediate_size=1024, num_experts=512,
-    #   num_experts_per_tok=10, hidden_act="silu".
+    # experts, TP=4. From its text_config: hidden_size=4096,
+    # moe_intermediate_size=1024, num_experts=512, num_experts_per_tok=10,
+    # hidden_act="silu".
     # Under TP=4 the expert intermediate dim is sharded across ranks, so each
     # rank's GEMM1 is K=4096 (hidden, unsharded) x N=1024/4=256 per expert
-    # (interleaved gate+up width 2N=512). With top-10 routing over 512
-    # experts, 8192 tokens give 8192*10=81920 token-expert pairs, i.e.
-    # avg_m = 81920/512 = 160 rows per expert.
+    # (interleaved gate+up width 2N=512).
+    # decode-m1/m8 and mid-m32/m128 use representative avg_m values (same
+    # convention as the qwen3-30b-a3b-* decode/mid entries above); the
+    # prefill8192-tp4 entry derives avg_m from a concrete 8192-token
+    # prefill batch: 8192 tokens * top-10 routing = 81920 token-expert
+    # pairs over 512 experts = 160 rows/expert on average.
+    {
+        "name": "qwen3.5-397b-a17b-decode-m1",
+        "num_experts": 512,
+        "K": 4096,
+        "N": 256,
+        "avg_m": 1,
+    },
+    {
+        "name": "qwen3.5-397b-a17b-decode-m8",
+        "num_experts": 512,
+        "K": 4096,
+        "N": 256,
+        "avg_m": 8,
+    },
+    {
+        "name": "qwen3.5-397b-a17b-mid-m32",
+        "num_experts": 512,
+        "K": 4096,
+        "N": 256,
+        "avg_m": 32,
+    },
+    {
+        "name": "qwen3.5-397b-a17b-mid-m128",
+        "num_experts": 512,
+        "K": 4096,
+        "N": 256,
+        "avg_m": 128,
+    },
     {
         "name": "qwen3.5-397b-a17b-prefill8192-tp4",
         "num_experts": 512,
