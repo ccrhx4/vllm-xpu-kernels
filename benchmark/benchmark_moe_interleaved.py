@@ -67,6 +67,46 @@ shape_configs = [
         "N": 768,
         "avg_m": 512,
     },
+    # Qwen3.5-35B-A3B (huggingface.co/Qwen/Qwen3.5-35B-A3B). From its
+    # text_config: hidden_size=2048, moe_intermediate_size=512,
+    # num_experts=256, num_experts_per_tok=8, hidden_act="silu",
+    # num_hidden_layers=40. N here is the full (unsharded) gate/up width,
+    # matching the qwen3-30b-a3b-* convention above.
+    {
+        "name": "qwen3.5-35b-a3b-decode-m1",
+        "num_experts": 256,
+        "K": 2048,
+        "N": 512,
+        "avg_m": 1,
+    },
+    {
+        "name": "qwen3.5-35b-a3b-decode-m8",
+        "num_experts": 256,
+        "K": 2048,
+        "N": 512,
+        "avg_m": 8,
+    },
+    {
+        "name": "qwen3.5-35b-a3b-mid-m32",
+        "num_experts": 256,
+        "K": 2048,
+        "N": 512,
+        "avg_m": 32,
+    },
+    {
+        "name": "qwen3.5-35b-a3b-mid-m128",
+        "num_experts": 256,
+        "K": 2048,
+        "N": 512,
+        "avg_m": 128,
+    },
+    {
+        "name": "qwen3.5-35b-a3b-prefill-m512",
+        "num_experts": 256,
+        "K": 2048,
+        "N": 512,
+        "avg_m": 512,
+    },
     {
         "name": "wide-N-8e-k2048-n4096-m1024",
         "num_experts": 8,
@@ -87,6 +127,22 @@ shape_configs = [
         "K": 7168,
         "N": 2048,
         "avg_m": 512,
+    },
+    # Qwen3.5-397B-A17B (huggingface.co/Qwen/Qwen3.5-397B-A17B), routed MoE
+    # experts, prefill batch 8192 tokens, TP=4. From its text_config:
+    #   hidden_size=4096, moe_intermediate_size=1024, num_experts=512,
+    #   num_experts_per_tok=10, hidden_act="silu".
+    # Under TP=4 the expert intermediate dim is sharded across ranks, so each
+    # rank's GEMM1 is K=4096 (hidden, unsharded) x N=1024/4=256 per expert
+    # (interleaved gate+up width 2N=512). With top-10 routing over 512
+    # experts, 8192 tokens give 8192*10=81920 token-expert pairs, i.e.
+    # avg_m = 81920/512 = 160 rows per expert.
+    {
+        "name": "qwen3.5-397b-a17b-prefill8192-tp4",
+        "num_experts": 512,
+        "K": 4096,
+        "N": 256,
+        "avg_m": 160,
     },
 ]
 
