@@ -95,6 +95,31 @@ void launch_dense_interleaved(
         gemm1_limit,                                                \
         ld_b)
 
+  // Config-1-only raster swizzle (design.md's swizzle=8): empirically this
+  // only helps the large-M/256x256-tile case (case 5, the "default" below)
+  // and *hurts* the smaller tile configs (0-4), so it is opted into via an
+  // explicit KSwizzleM=8 template arg only on that one instantiation.
+  #define CALL_DENSE_INTERLEAVED_LAUNCHER_SWZ(TileFull, TileHalf, SGL, Swz) \
+    Xe20DenseMLPGEMMInterleavedLauncher<                                   \
+        TileFull,                                                          \
+        TileHalf,                                                          \
+        SGL,                                                               \
+        ActType,                                                           \
+        WithBias,                                                          \
+        Swz>(                                                              \
+        queue,                                                             \
+        activations,                                                       \
+        weight,                                                            \
+        bias,                                                              \
+        outputs,                                                           \
+        gemm_m,                                                            \
+        gemm_n,                                                            \
+        gemm_k,                                                            \
+        workspace,                                                         \
+        gemm1_alpha,                                                        \
+        gemm1_limit,                                                        \
+        ld_b)
+
   switch (tile_id) {
     case 0:
       CALL_DENSE_INTERLEAVED_LAUNCHER(Tile_8_128_32, Tile_8_64_32, SG_1_4_1);
@@ -112,10 +137,11 @@ void launch_dense_interleaved(
       CALL_DENSE_INTERLEAVED_LAUNCHER(Tile_256_128_32, Tile_256_64_32, SG_8_2_1);
       break;
     default:
-      CALL_DENSE_INTERLEAVED_LAUNCHER(Tile_256_256_32, Tile_256_128_32, SG_8_4_1);
+      CALL_DENSE_INTERLEAVED_LAUNCHER_SWZ(Tile_256_256_32, Tile_256_128_32, SG_8_4_1, 8);
       break;
   }
   #undef CALL_DENSE_INTERLEAVED_LAUNCHER
+  #undef CALL_DENSE_INTERLEAVED_LAUNCHER_SWZ
 }
 
 }  // namespace

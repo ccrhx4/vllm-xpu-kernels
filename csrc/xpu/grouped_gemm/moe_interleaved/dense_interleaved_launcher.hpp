@@ -28,7 +28,15 @@ class DenseGemmXe20InterleavedName;
 // TileFull is the un-halved (gate+up) accumulator-space tile; TileHalf is the
 // same tile with N halved, used only to size the D-side copy/fragment (see
 // moe_mainloop_interleaved.hpp for why the two must be decoupled).
-template <typename TileFull, typename TileHalf, typename SGLayout, ActivationType ActType, bool WithBias>
+// KSwizzleM: raster-swizzle band width (see dense_kernel_interleaved.hpp's
+// DenseGEMMInterleaved KSwizzleM doc comment). Default 1 = original raster.
+template <
+    typename TileFull,
+    typename TileHalf,
+    typename SGLayout,
+    ActivationType ActType,
+    bool WithBias,
+    int KSwizzleM = 1>
 void Xe20DenseMLPGEMMInterleavedLauncher(
     sycl::queue q,
     const void* activations,
@@ -94,7 +102,11 @@ void Xe20DenseMLPGEMMInterleavedLauncher(
       MMAHalf,
       ActType,
       WithBias,
-      Element>;
+      Element,
+      Element,
+      Element,
+      void,
+      KSwizzleM>;
   typename Kernel::Params params{
       static_cast<const Element*>(activations),
       static_cast<const Element*>(weights),

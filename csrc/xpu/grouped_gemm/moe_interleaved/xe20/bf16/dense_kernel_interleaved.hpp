@@ -84,7 +84,15 @@ template <
     typename ElementA,
     typename ElementB = ElementA,
     typename ElementD = ElementA,
-    typename GmemTiledCopyD = void>
+    typename GmemTiledCopyD = void,
+    // Raster-swizzle band width (design.md's dispatch "swizzle" knob;
+    // Config 1 uses swizzle=8). Default 1 reduces to the original plain
+    // row-major raster (m_coord = tile_id / num_n_tiles) -- see operator()
+    // below. Only beneficial for large, compute-bound M with the big
+    // (256x256) tile; empirically *harmful* for the smaller
+    // decode/mid-M tile configs, so callers should only opt into a
+    // non-default value for that tile (see dense_select_tile()).
+    int KSwizzleM = 1>
 class DenseGEMMInterleaved {
  public:
   using TiledCopyA = decltype(make_block_2d_copy_A(TiledMMA{}, TensorA{}));
@@ -188,9 +196,22 @@ class DenseGEMMInterleaved {
     auto D_tensor = make_D_tensor(params.Outputs, M, N);
     auto Bias_tensor = make_Bias_tensor(params.Bias, N);
 
+    // L2/L3-locality raster swizzle (design.md's "swizzle" dispatch knob,
+    // Config 1 uses swizzle=8): instead of a plain row-major raster
+    // (m_coord = tile_id / num_n_tiles), group tiles into bands of
+    // kSwizzleM consecutive M-tiles and sweep N-major *within* each band.
+    // Work-groups executing concurrently get consecutive tile_ids, so this
+    // keeps them reading the same small band of A-tile rows while they
+    // sweep across N -- improving A-tile reuse in L2/L3 across concurrently
+    // resident work-groups (the B operand is the one that dominates memory
+    // traffic here: N=17408 is far larger than a kSwizzleM-row A band).
     while (group_id < total_tiles) {
-      int m_coord = group_id / num_n_tiles;
-      int n_coord = group_id % num_n_tiles;
+      int num_pid_in_band = KSwizzleM * num_n_tiles;
+      int band_id = group_id / num_pid_in_band;
+      int first_m = band_id * KSwizzleM;
+      int band_size_m = min(num_m_tiles - first_m, KSwizzleM);
+      int m_coord = first_m + (group_id % band_size_m);
+      int n_coord = (group_id % num_pid_in_band) / band_size_m;
 
       CollectiveMainloop mainloop;
       auto tile_coord = make_coord(m_coord, n_coord, 0);
