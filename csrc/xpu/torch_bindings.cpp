@@ -2,6 +2,7 @@
 #include "xpu/ops.h"
 #ifdef VLLM_MOE_ENABLED
   #include "xpu/grouped_gemm/grouped_gemm_interface.h"
+  #include "xpu/grouped_gemm/moe_interleaved/dense_mlp_interleaved.h"
   #include "xpu/grouped_gemm/moe_interleaved/moe_grouped_mm_interleaved.h"
 #endif
 #include "xpu/lora/lora_ops.h"
@@ -78,6 +79,18 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, xpu_ops) {
       "moe_grouped_mm_xe20_interleaved",
       torch::kXPU,
       &moe_grouped_mm_xe20_interleaved);
+
+  // Plain (non-grouped) dense-MLP analog of the above, for a dense FFN's
+  // gate/up projection (no expert routing). See
+  // xpu/grouped_gemm/moe_interleaved/dense_mlp_interleaved.h.
+  xpu_ops.def(
+      "dense_swiglu_gemm_xe20_interleaved(Tensor(a!) output, Tensor activations, "
+      "Tensor weight, Tensor? bias, int activation_type, float gemm1_alpha, "
+      "float gemm1_limit) -> Tensor");
+  xpu_ops.impl(
+      "dense_swiglu_gemm_xe20_interleaved",
+      torch::kXPU,
+      &dense_swiglu_gemm_xe20_interleaved);
 #endif
 
   xpu_ops.def(
