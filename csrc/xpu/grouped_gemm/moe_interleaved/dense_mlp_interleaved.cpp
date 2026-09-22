@@ -34,29 +34,30 @@ using SG_4_2_1 = Layout<Shape<_4, _2, _1>, Stride<_2, _1, _0>>;
 using SG_8_2_1 = Layout<Shape<_8, _2, _1>, Stride<_2, _1, _0>>;
 using SG_8_4_1 = Layout<Shape<_8, _4, _1>, Stride<_4, _1, _0>>;
 
-// See moe_grouped_mm_interleaved.cpp's copy of this constant for provenance
-// (sgl-kernel-xpu's kGroupedGemmSmallWeightThreshold); duplicated here for
-// the same reason (no shared dual-accumulator dense path to pull it from).
-constexpr int64_t kGroupedGemmSmallWeightThreshold = 4096LL * 4096LL;
-
-// Identical breakpoints to moe_grouped_mm_interleaved.cpp's
-// interleaved_select_tile() -- see that file for the full tile-id table and
-// rationale. Here `m` is the dense batch's raw row count (no per-expert
-// averaging).
+// Tile selection for the dense (non-grouped) path. Originally mirrored
+// moe_grouped_mm_interleaved.cpp's interleaved_select_tile() breakpoints
+// verbatim, gating the smaller M-matched tiles (1/2/3) behind a
+// "small_weight" (K*N) heuristic. That heuristic was calibrated for MoE's
+// *averaged* per-expert M (avg_m), where a large per-expert weight combined
+// with a small avg_m still implies enough total work across experts to
+// justify a big tile. In the dense case there is only one, exact M (no
+// per-expert averaging), and a direct tile-id sweep
+// (benchmark/sweep_dense_mlp_tile_ids.py) across Qwen3.6-27B's actual
+// TP1/2/4 shapes showed the weight-size gate was actively harmful: it forced
+// small M (32, 128) into the oversized 256-row tile 4 even though N was
+// always large enough to fail "small_weight" at every TP degree, when the
+// exactly-M-matched tile (2 or 3) was faster in every case tested (e.g. TP4
+// M=128: oversized tile4 was 28% *slower* than oneDNN; the matched tile3 is
+// 5.5% *faster*). So tile selection here depends on M alone; only the
+// M>=256 Config-1 (tile 5) path additionally checks gemm_n, matching its
+// swizzle-tuning scope (see dense_kernel_interleaved.hpp's KSwizzleM).
 inline int dense_select_tile(int m, int gemm_k, int gemm_n) {
-  const int real_n = gemm_n / 2;
-  const bool small_weight =
-      static_cast<int64_t>(gemm_k) * real_n <= kGroupedGemmSmallWeightThreshold;
-  const bool narrow_k = gemm_k <= 256;
-  const bool narrow_n_fused = real_n <= 512;
-
+  (void)gemm_k;  // no longer used for tile selection; see comment above.
   if (m >= 256 && gemm_n >= 256) return 5;
   if (m <= 8) return 0;
-  if (m <= 16 && small_weight) return 1;
-  if (m <= 32 && small_weight) return 2;
-  if (m <= 128 && small_weight) return 3;
-  if (narrow_k) return 3;
-  if (narrow_n_fused) return 3;
+  if (m <= 16) return 1;
+  if (m <= 32) return 2;
+  if (m <= 128) return 3;
   return 4;
 }
 
@@ -154,7 +155,8 @@ torch::Tensor dense_swiglu_gemm_xe20_interleaved(
     const c10::optional<at::Tensor>& bias,
     int64_t activation_type,
     double gemm1_alpha,
-    double gemm1_limit) {
+    double gemm1_limit,
+    int64_t tile_id_override) {
 #ifndef VLLM_XPU_ENABLE_XE2
   TORCH_CHECK(
       false,
@@ -209,8 +211,10 @@ torch::Tensor dense_swiglu_gemm_xe20_interleaved(
       at::empty({1}, activations.options().dtype(at::kInt));
   const void* bias_ptr = with_bias ? bias->data_ptr() : nullptr;
   int ld_b = static_cast<int>(weight.stride(0));
-  const int tile_id = dense_select_tile(
-      static_cast<int>(gemm_m), static_cast<int>(gemm_k), static_cast<int>(gemm_n));
+  const int tile_id = tile_id_override >= 0
+      ? static_cast<int>(tile_id_override)
+      : dense_select_tile(
+            static_cast<int>(gemm_m), static_cast<int>(gemm_k), static_cast<int>(gemm_n));
 
   if (activation_type == static_cast<int64_t>(MoE::ActivationType::SILU)) {
     if (with_bias) {

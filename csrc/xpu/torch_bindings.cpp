@@ -86,7 +86,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, xpu_ops) {
   xpu_ops.def(
       "dense_swiglu_gemm_xe20_interleaved(Tensor(a!) output, Tensor activations, "
       "Tensor weight, Tensor? bias, int activation_type, float gemm1_alpha, "
-      "float gemm1_limit) -> Tensor");
+      "float gemm1_limit, int tile_id_override=-1) -> Tensor");
   xpu_ops.impl(
       "dense_swiglu_gemm_xe20_interleaved",
       torch::kXPU,

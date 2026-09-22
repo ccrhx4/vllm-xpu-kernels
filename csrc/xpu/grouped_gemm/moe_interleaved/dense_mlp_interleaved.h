@@ -20,6 +20,10 @@
 // bias:        optional [N] float32, pre-interleaved to match weight
 // output:      [M, N / 2] bf16 (SwiGLU-fused gate*up output)
 // activation_type: 0 = silu, 1 = gelu (matches MoE::ActivationType)
+// tile_id_override: -1 (default) = auto-select via dense_select_tile(); else
+// force a specific tile config (0-5, see dense_select_tile()'s table) --
+// exposed for op-level tile-tuning/benchmarking only, not meant for
+// production callers.
 torch::Tensor dense_swiglu_gemm_xe20_interleaved(
     torch::Tensor& output,
     const torch::Tensor& activations,
@@ -27,4 +31,5 @@ torch::Tensor dense_swiglu_gemm_xe20_interleaved(
     const c10::optional<at::Tensor>& bias,
     int64_t activation_type,
     double gemm1_alpha,
-    double gemm1_limit);
+    double gemm1_limit,
+    int64_t tile_id_override = -1);
