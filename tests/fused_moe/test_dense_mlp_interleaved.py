@@ -45,7 +45,7 @@ def _ref_gemm_activation(acts, w13, bias, activation):
     return ref_out
 
 
-def _run_case(hidden, inter, m, activation, with_bias):
+def _run_case(hidden, inter, m, activation, with_bias, tile_id_override=-1):
     seed_everything(0)
     k = hidden
     n_full = 2 * inter
@@ -78,7 +78,8 @@ def _run_case(hidden, inter, m, activation, with_bias):
         bias=bias_interleaved,
         activation_type=activation_type,
         gemm1_alpha=1.702,
-        gemm1_limit=7.0)
+        gemm1_limit=7.0,
+        tile_id_override=tile_id_override)
 
     torch.testing.assert_close(
         ref_out.float(), fused_out.float(), atol=2e-2, rtol=2e-2)
@@ -90,6 +91,36 @@ def test_dense_mlp_interleaved(shape, activation):
     hidden, inter, m = shape
     with_bias = activation == "gelu"
     _run_case(hidden, inter, m, activation, with_bias)
+
+
+# Explicit per-tile correctness coverage (tile_id_override 0-8, see
+# dense_select_tile()/launch_dense_interleaved() in dense_mlp_interleaved.cpp).
+# Tiles 6/7/8 were added when investigating the "wave-count quantization"
+# gap at small-N/moderate-M shapes (e.g. TP4 M=256/512/1024); tile 8
+# (128x128, SG 4x4x1, swizzled) is now selected by dense_select_tile() for
+# those shapes, replacing tile 5 there -- exercised explicitly here since the
+# auto-select path alone wouldn't otherwise cover every tile id.
+ALL_TILE_IDS = [0, 1, 2, 3, 4, 5, 6, 7, 8]
+
+
+@pytest.mark.parametrize("tile_id", ALL_TILE_IDS)
+def test_dense_mlp_interleaved_all_tiles(tile_id):
+    # Qwen3.6-27B TP4-shaped N (hidden=5120, per-rank intermediate=4352) at
+    # M=512 -- large enough that every tile id (including the small M-tiles
+    # 0-3, which are far from their intended M range here) still produces a
+    # numerically valid, correctness-checkable result.
+    _run_case(5120, 4352, 512, "silu", with_bias=False,
+              tile_id_override=tile_id)
+
+
+@pytest.mark.parametrize("tp_n", [(1, 34816), (2, 17408), (4, 8704)])
+@pytest.mark.parametrize("m", [256, 512, 1024, 2048])
+def test_dense_mlp_interleaved_wave_crossover_shapes(tp_n, m):
+    # Correctness at the exact (TP, M) crossover shapes where
+    # dense_select_tile() switches between tile 5 and tile 8 based on the
+    # wave-inflation heuristic -- see the comment above dense_select_tile().
+    _, n_full = tp_n
+    _run_case(5120, n_full // 2, m, "silu", with_bias=False)
 
 
 def test_dense_mlp_interleaved_bias_fp32_required():

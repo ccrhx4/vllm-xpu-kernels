@@ -29,10 +29,12 @@ using Tile_128_64_32 = Shape<_128, _64, _32>;
 using Tile_256_128_32 = Shape<_256, _128, _32>;
 using Tile_256_64_32 = Shape<_256, _64, _32>;
 using Tile_256_256_32 = Shape<_256, _256, _32>;
+using Tile_128_256_32 = Shape<_128, _256, _32>;
 using SG_1_4_1 = Layout<Shape<_1, _4, _1>, Stride<_4, _1, _0>>;
 using SG_4_2_1 = Layout<Shape<_4, _2, _1>, Stride<_2, _1, _0>>;
 using SG_8_2_1 = Layout<Shape<_8, _2, _1>, Stride<_2, _1, _0>>;
 using SG_8_4_1 = Layout<Shape<_8, _4, _1>, Stride<_4, _1, _0>>;
+using SG_4_4_1 = Layout<Shape<_4, _4, _1>, Stride<_4, _1, _0>>;
 
 // Tile selection for the dense (non-grouped) path. Originally mirrored
 // moe_grouped_mm_interleaved.cpp's interleaved_select_tile() breakpoints
@@ -49,11 +51,40 @@ using SG_8_4_1 = Layout<Shape<_8, _4, _1>, Stride<_4, _1, _0>>;
 // exactly-M-matched tile (2 or 3) was faster in every case tested (e.g. TP4
 // M=128: oversized tile4 was 28% *slower* than oneDNN; the matched tile3 is
 // 5.5% *faster*). So tile selection here depends on M alone; only the
-// M>=256 Config-1 (tile 5) path additionally checks gemm_n, matching its
+// M>=256 Config-1 path additionally checks gemm_n, matching its
 // swizzle-tuning scope (see dense_kernel_interleaved.hpp's KSwizzleM).
+//
+// Within the M>=256 regime, tile 5 (256x256, SG 8x4x1, swizzled) and tile 8
+// (128x128, SG 4x4x1, swizzled) trade places depending on shape: total
+// kernel time is dominated by "wave count" (ceil(total_tiles / 32), this
+// platform has 32 subslices) when total_tiles is small, since a partial
+// final wave leaves subslices idle. Tile 5's larger 256x256 tile produces
+// far fewer total tiles at small N (e.g. TP4's per-rank N=8704 -> only 34
+// N-tiles), so a moderate M can land far from a clean multiple of 32
+// ("wave-quantization tail"), while tile 8's smaller 128x128 tile produces
+// 4x more, finer-grained tiles that land close to a clean wave boundary
+// much sooner. Once M grows large enough that tile 5's own total_tiles is
+// already near a wave boundary, tile 5's superior per-tile reuse/arithmetic
+// intensity wins outright (confirmed by direct measurement: TP4 M=2048/4096
+// clearly favor tile 5 despite tile 8 having equal or better predicted wave
+// alignment there -- the wave-count model alone is not sufficient at that
+// end of the range). Empirically (TP1/2/4 x M in {256,512,1024,2048,4096}),
+// the crossover is well predicted by tile 5's own wave-inflation ratio
+// (ceil(total5/32) / (total5/32.0)): pick tile 8 when that ratio is >=1.15,
+// else tile 5. This reproduces the measured crossover (TP4: tile8 wins at
+// M=256/512/1024, tile5 wins at M=2048/4096; TP1/TP2 M=512 stay on tile5,
+// where tile8 was verified to be a no-op/tiny-win, not a regression).
 inline int dense_select_tile(int m, int gemm_k, int gemm_n) {
   (void)gemm_k;  // no longer used for tile selection; see comment above.
-  if (m >= 256 && gemm_n >= 256) return 5;
+  if (m >= 256 && gemm_n >= 256) {
+    int m_tiles5 = (m + 255) / 256;
+    int n_tiles5 = (gemm_n + 255) / 256;
+    int total5 = m_tiles5 * n_tiles5;
+    constexpr int kSubslices = 32;
+    int waves5 = (total5 + kSubslices - 1) / kSubslices;
+    double infl5 = (waves5 * static_cast<double>(kSubslices)) / total5;
+    return (infl5 >= 1.15) ? 8 : 5;
+  }
   if (m <= 8) return 0;
   if (m <= 16) return 1;
   if (m <= 32) return 2;
@@ -132,10 +163,33 @@ void launch_dense_interleaved(
       CALL_DENSE_INTERLEAVED_LAUNCHER(Tile_32_128_32, Tile_32_64_32, SG_1_4_1);
       break;
     case 3:
-      CALL_DENSE_INTERLEAVED_LAUNCHER(Tile_128_128_32, Tile_128_64_32, SG_4_2_1);
+      CALL_DENSE_INTERLEAVED_LAUNCHER_SWZ(Tile_128_128_32, Tile_128_64_32, SG_4_2_1, 8);
       break;
     case 4:
-      CALL_DENSE_INTERLEAVED_LAUNCHER(Tile_256_128_32, Tile_256_64_32, SG_8_2_1);
+      CALL_DENSE_INTERLEAVED_LAUNCHER_SWZ(Tile_256_128_32, Tile_256_64_32, SG_8_2_1, 8);
+      break;
+    case 6:
+      // Experimental: same 256x128 accumulator tile as tile 4, but with a
+      // 4x4x1 (16-subgroup) partition instead of 8x2x1 -- same per-subgroup
+      // register footprint (256/4 x 128/4 = 64x32, vs tile4's 256/8 x 128/2
+      // = 32x64), same total area, different aspect ratio/occupancy profile.
+      // Added to probe whether this narrows the TP4 M=512 gap vs. tile 5.
+      // Swizzle=8 applied per user request, matching tile 5's Config-1 raster
+      // swizzle.
+      CALL_DENSE_INTERLEAVED_LAUNCHER_SWZ(Tile_256_128_32, Tile_256_64_32, SG_4_4_1, 8);
+      break;
+    case 7:
+      // 128x256 accumulator, SG 4x4x1: per-SG 128/4 x 256/4 = 32x64 (same
+      // 2048 area as above), transposed aspect ratio vs. case 6. Swizzle=8
+      // applied per user request.
+      CALL_DENSE_INTERLEAVED_LAUNCHER_SWZ(Tile_128_256_32, Tile_128_128_32, SG_4_4_1, 8);
+      break;
+    case 8:
+      // 128x128 accumulator, SG 4x4x1: per-SG 128/4 x 128/4 = 32x32 (1024
+      // area -- half the footprint of the other experimental configs),
+      // trading tile size (more, smaller tiles) for lower register pressure.
+      // Swizzle=8 applied per user request.
+      CALL_DENSE_INTERLEAVED_LAUNCHER_SWZ(Tile_128_128_32, Tile_128_64_32, SG_4_4_1, 8);
       break;
     default:
       CALL_DENSE_INTERLEAVED_LAUNCHER_SWZ(Tile_256_256_32, Tile_256_128_32, SG_8_4_1, 8);
