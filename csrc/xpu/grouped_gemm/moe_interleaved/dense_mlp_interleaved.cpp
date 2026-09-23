@@ -83,7 +83,19 @@ inline int dense_select_tile(int m, int gemm_k, int gemm_n) {
     constexpr int kSubslices = 32;
     int waves5 = (total5 + kSubslices - 1) / kSubslices;
     double infl5 = (waves5 * static_cast<double>(kSubslices)) / total5;
-    return (infl5 >= 1.15) ? 8 : 5;
+    // Tile 10 (256x128 accum, SG 8x4x1 -- per-SG 32x32) supersedes tile 8
+    // (128x128 accum, SG 4x4x1 -- per-SG 32x32 too, but only 16
+    // subgroups/WG instead of 32) as the "finer-grained than tile 5"
+    // alternative: measured across TP1/2/4 x M in {256,512,1024,2048,4096},
+    // tile 10 matches or beats tile 8 at *every* point tile 8 was
+    // previously selected here (e.g. TP4/M=512: 0.365ms vs tile 8's
+    // 0.373ms), with no regressions found. See tile 9/10's comments below
+    // for why: tile 10 keeps a "real" 32x32 per-subgroup tile (like tile
+    // 8) while widening to oneDNN's gemmstone-catalog-preferred SG 8x4
+    // layout, instead of tile 9's mistake of keeping tile 8's small
+    // 128x128 workgroup tile *and* widening to SG 8x4 (which shrank the
+    // per-SG tile to a losing 16x32).
+    return (infl5 >= 1.15) ? 10 : 5;
   }
   if (m <= 8) return 0;
   if (m <= 16) return 1;
@@ -218,6 +230,23 @@ void launch_dense_interleaved(
       // transferable "more subgroups is better" rule. Kept here only as a
       // documented negative result; not reachable via dense_select_tile().
       CALL_DENSE_INTERLEAVED_LAUNCHER_SWZ(Tile_128_128_32, Tile_128_64_32, SG_8_4_1, 8);
+      break;
+    case 10:
+      // 256x128 accumulator, SG 8x4x1 (32 subgroups/WG, same as tile 5 and
+      // tile 9): per-SG tile = 256/8 x 128/4 = 32x32. This is the genuinely
+      // untested middle ground tile 9 was missing -- tile 9 kept oneDNN's
+      // winning WG8x4 subgroup count but paired it with a too-small 128x128
+      // *workgroup* tile (per-SG only 16x32), losing the large-per-subgroup
+      // side of oneDNN's actual winning catalog entry (Unroll 32x48, WG
+      // 8x4 -> per-SG tile 32x48, total WG tile 256x192). This tile can't
+      // hit 256x192 exactly (kernel's tile enumeration is power-of-2/4
+      // sized), but 256x128 w/ SG8x4 gets per-SG M=32 to match oneDNN's
+      // UnrollM=32 exactly (N=32 vs oneDNN's UnrollN=48, close-ish), while
+      // still being half the total WG area of tile 5 (256x128 vs 256x256)
+      // -- i.e. finer-grained than tile 5 (better wave-count behavior at
+      // M=512, per the tile5-vs-tile8 analysis above) while keeping a
+      // "real" per-SG tile size instead of tile 9's thin 16x32.
+      CALL_DENSE_INTERLEAVED_LAUNCHER_SWZ(Tile_256_128_32, Tile_256_64_32, SG_8_4_1, 8);
       break;
     default:
       CALL_DENSE_INTERLEAVED_LAUNCHER_SWZ(Tile_256_256_32, Tile_256_128_32, SG_8_4_1, 8);
