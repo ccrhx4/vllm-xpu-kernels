@@ -191,6 +191,34 @@ void launch_dense_interleaved(
       // Swizzle=8 applied per user request.
       CALL_DENSE_INTERLEAVED_LAUNCHER_SWZ(Tile_128_128_32, Tile_128_64_32, SG_4_4_1, 8);
       break;
+    case 9:
+      // 128x128 accumulator, SG 8x4x1 (32 subgroups/WG -- same subgroup
+      // *count* as tile 5/default, which oneDNN's own unconstrained
+      // gemmstone catalog dispatch independently confirms is the
+      // occupancy-optimal WG size at this TP4/M=512 shape), but with tile
+      // 5's coarse 256x256 accumulator swapped for tile 8's finer 128x128
+      // one. Motivation: tile 5 loses to tile 8 at M=512 purely from
+      // wave-count quantization tail (256-row tiles don't divide 512/N
+      // evenly into a clean multiple of 32 subslices), not from having the
+      // "wrong" subgroup count -- so this probes whether combining tile 8's
+      // finer granularity with tile 5's wider (8x4) subgroup layout beats
+      // both. Per-SG tile: 128/8 x 128/4 = 16x32.
+      //
+      // RESULT (measured, TP1/2/4 x M in {256,512,1024,2048,4096}): tile 9
+      // is uniformly *worse* than both tile 5 and tile 8 at every point
+      // (e.g. TP4/M=512: tile9 0.428ms vs tile5 0.392ms vs tile8 0.374ms;
+      // gap widens at larger M, e.g. TP1/M=4096: tile9 14.19ms vs tile5
+      // 9.12ms). Mechanically swapping in oneDNN's preferred WG8x4 subgroup
+      // count while keeping a small 128x128 accumulator shrinks the
+      // per-subgroup tile to a very thin 16x32, which cuts per-subgroup
+      // data reuse/arithmetic intensity far more than the extra parallelism
+      // gains back -- confirming that oneDNN's WG8x4 preference in the
+      // gemmstone catalog is tied to its own much larger accompanying
+      // unroll (32x48 in the winning catalog entry), not a generically
+      // transferable "more subgroups is better" rule. Kept here only as a
+      // documented negative result; not reachable via dense_select_tile().
+      CALL_DENSE_INTERLEAVED_LAUNCHER_SWZ(Tile_128_128_32, Tile_128_64_32, SG_8_4_1, 8);
+      break;
     default:
       CALL_DENSE_INTERLEAVED_LAUNCHER_SWZ(Tile_256_256_32, Tile_256_128_32, SG_8_4_1, 8);
       break;
